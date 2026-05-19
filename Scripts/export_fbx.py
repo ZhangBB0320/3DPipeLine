@@ -148,6 +148,10 @@ def export_fbx(
 
     file_size = Path(output_path).stat().st_size
     print(f"\n  导出完成! 文件大小: {file_size / 1024 / 1024:.2f} MB")
+
+    # ===== 清理垃圾文件：只保留目标文件 =====
+    _cleanup_output_dir(output_path)
+
     print(f"========================\n")
     return output_path
 
@@ -252,8 +256,45 @@ def export_obj(
 
     file_size = Path(output_path).stat().st_size
     print(f"\n  导出完成! 文件大小: {file_size / 1024 / 1024:.2f} MB")
+
+    # ===== 清理垃圾文件：只保留目标文件 =====
+    _cleanup_output_dir(output_path)
+
     print(f"========================\n")
     return output_path
+
+
+def _cleanup_output_dir(target_path):
+    """
+    清理输出目录中的垃圾文件，只保留目标文件。
+    当 path_mode='COPY' 时，Blender 会复制纹理到输出目录，
+    产生 .mtl/.jpg/.png/.exr 等无关文件，必须删除。
+    """
+    target = Path(target_path).resolve()
+    output_dir = target.parent
+    target_name = target.stem  # 不含扩展名
+
+    removed = []
+    for f in output_dir.iterdir():
+        if not f.is_file():
+            continue
+        # 保留目标文件本身
+        if f.resolve() == target:
+            continue
+        # 删除与目标文件同名的伴随文件（如 .mtl）
+        if f.stem == target_name:
+            f.unlink()
+            removed.append(f.name)
+            continue
+        # 删除常见纹理格式文件
+        if f.suffix.lower() in ('.mtl', '.jpg', '.jpeg', '.png', '.exr', '.tga', '.bmp', '.tif', '.tiff', '.webp', '.dds'):
+            f.unlink()
+            removed.append(f.name)
+
+    if removed:
+        print(f"  [清理] 删除 {len(removed)} 个垃圾文件: {', '.join(removed)}")
+    else:
+        print(f"  [清理] 无需清理")
 
 
 def export(
