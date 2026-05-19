@@ -5,6 +5,9 @@
 .DS_Store
 Thumbs.db
 
+# Output
+outPut/
+
 # IDE
 .idea/
 .vscode/
