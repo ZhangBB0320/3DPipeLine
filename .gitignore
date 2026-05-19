@@ -1,15 +1,6 @@
-# CodeBuddy
-.codebuddy/
 
-# OS
-.DS_Store
-Thumbs.db
+# Python cache
+Scripts/__pycache__/
+**/__pycache__/
+*.pyc
 
-# Output
-outPut/
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
