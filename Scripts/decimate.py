@@ -4,8 +4,8 @@ MeshLab 减面脚本 - 使用 pymeshlab
 输出结构: outPut/<日期>/模型名.obj (纯几何，无材质/纹理)
 """
 import pymeshlab
-import sys
-import os
+import argparse
+from pathlib import Path
 from datetime import datetime
 
 
@@ -138,36 +138,33 @@ def process(input_path, output_base_dir, target_faces=3000):
     decimate(ms, target_faces)
 
     # 保存输出
-    date_folder = datetime.now().strftime("%Y%m%d")
-    output_dir = os.path.join(output_base_dir, date_folder)
-    os.makedirs(output_dir, exist_ok=True)
+    out_dir = Path(output_base_dir) / datetime.now().strftime("%Y%m%d")
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    model_name = os.path.splitext(os.path.basename(input_path))[0]
+    model_name = Path(input_path).stem
     # pymeshlab 不支持中文路径输出，先临时名再重命名
-    tmp_obj = os.path.join(output_dir, "tmp_output.obj")
+    tmp_obj = str(out_dir / "tmp_output.obj")
     ms.save_current_mesh(tmp_obj)
 
-    final_obj = os.path.join(output_dir, f"{model_name}.obj")
-    if os.path.exists(final_obj):
-        os.remove(final_obj)
+    final_obj = out_dir / f"{model_name}.obj"
+    if final_obj.exists():
+        final_obj.unlink()
 
     # 清理 OBJ 中的材质引用行，输出纯几何文件
-    with open(tmp_obj, 'r', encoding='utf-8', errors='ignore') as f:
-        lines = f.readlines()
-    clean_lines = [l for l in lines if not l.startswith('mtllib ') and not l.startswith('usemtl ')]
-    with open(final_obj, 'w', encoding='utf-8') as f:
-        f.writelines(clean_lines)
-    os.remove(tmp_obj)
+    tmp_obj_path = Path(tmp_obj)
+    clean_lines = [l for l in tmp_obj_path.read_text(encoding='utf-8', errors='ignore').splitlines(keepends=True)
+                   if not l.startswith('mtllib ') and not l.startswith('usemtl ')]
+    final_obj.write_text(''.join(clean_lines), encoding='utf-8')
+    tmp_obj_path.unlink()
 
     # 清理 pymeshlab 自动生成的附带文件（MTL/PNG 等），只保留 OBJ
-    import glob
     for pattern in ['tmp_output.*', 'dummy.*']:
-        for f in glob.glob(os.path.join(output_dir, pattern)):
-            if not f.endswith('.obj'):
-                os.remove(f)
+        for f in out_dir.glob(pattern):
+            if f.suffix != '.obj':
+                f.unlink()
 
     print(f"\n已保存OBJ到: {final_obj}")
-    file_size = os.path.getsize(final_obj)
+    file_size = final_obj.stat().st_size
     print(f"文件大小: {file_size / 1024 / 1024:.1f} MB")
 
     # 打印总结
@@ -180,15 +177,29 @@ def process(input_path, output_base_dir, target_faces=3000):
 
 
 if __name__ == '__main__':
-    input_file = r"C:\Users\bobinzhang\Desktop\太空人2.0\Mesh\High\太空人Body.obj"
-    output_base_dir = r"i:\3DPipeLine\outPut"
-    target = 3000
+    parser = argparse.ArgumentParser(
+        description='MeshLab 减面脚本: 拓扑修复 -> 重网格化 -> 减面',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='示例:\n'
+               '  python decimate.py ./model.obj 3000\n'
+               '  python decimate.py /path/to/model.obj 5000 /path/to/output\n'
+        )
+    parser.add_argument('input', help='输入模型路径 (OBJ/FBX/STL/PLY 等)')
+    parser.add_argument('target_faces', nargs='?', type=int, default=3000,
+                        help='目标面数 (默认: 3000)')
+    parser.add_argument('output', nargs='?', default=None,
+                        help='输出目录 (默认: <项目根>/outPut/)')
+    args = parser.parse_args()
 
-    if len(sys.argv) > 1:
-        input_file = sys.argv[1]
-    if len(sys.argv) > 2:
-        target = int(sys.argv[2])
-    if len(sys.argv) > 3:
-        output_base_dir = sys.argv[3]
+    input_file = str(Path(args.input).resolve())
+    if not Path(input_file).exists():
+        parser.error(f'输入文件不存在: {input_file}')
 
-    process(input_file, output_base_dir, target)
+    if args.output:
+        output_base_dir = str(Path(args.output).resolve())
+    else:
+        # 项目根目录 = Scripts 的上一级
+        project_root = Path(__file__).resolve().parent.parent
+        output_base_dir = str(project_root / 'outPut')
+
+    process(input_file, output_base_dir, args.target_faces)
