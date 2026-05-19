@@ -112,6 +112,40 @@ For these integration tools, status checks are only needed once per session if t
 4. **Switching to alternative tools after one slow call.** First-call latency (cold start) is normal. Wait for the result.
 5. **Asking the user to re-confirm Blender state when they already confirmed.** Respect the user's stated context.
 
+## Critical: Stale Wrapper Process Pollution (Confirmed Root Cause)
+
+**Symptom**: `get_scene_info` / `get_viewport_screenshot` / `execute_blender_code` return empty strings or completely empty results, even though Blender is clearly running and the addon panel shows "Server Running".
+
+**Root cause**: CodeBuddy spawns one `uvx blender-mcp` wrapper process **per Plugin Helper / per session**. When the user reloads CodeBuddy, opens new windows, or switches workspaces, **old wrappers are NOT cleaned up**. They keep an ESTABLISHED TCP connection to Blender's port 9876 forever.
+
+When CodeBuddy issues a new MCP request, it goes to the *current* wrapper, which forwards to Blender. Blender responds, but the response routing inside Blender's per-connection thread sometimes ends up on a stale connection's socket buffer. The current wrapper times out / returns empty.
+
+**Diagnostic command** (run in shell):
+
+```bash
+# Count wrapper processes (healthy: 1-2; unhealthy: 4+)
+ps -ef | grep -E "blender-mcp|blender_mcp" | grep -v grep | wc -l
+
+# Count ESTABLISHED connections to Blender (healthy: 1-2; unhealthy: 4+)
+lsof -i :9876 2>/dev/null | grep ESTAB | wc -l
+```
+
+If either count is ≥ 4, you have wrapper pollution.
+
+**Fix** (kills all wrappers; CodeBuddy auto-respawns clean ones in ~2s):
+
+```bash
+pkill -9 -f "blender-mcp"
+# Wait 2 seconds for CodeBuddy to respawn fresh wrappers
+```
+
+After cleanup, the next `mcp_call_tool` invocation will work correctly.
+
+**Prevention**:
+- Avoid opening multiple CodeBuddy windows on the same workspace.
+- After any CodeBuddy window reload (`Developer: Reload Window`), run the diagnostic and fix if needed before resuming Blender work.
+- If MCP starts misbehaving mid-session, run the fix command **first** before reporting "connection failed" to the user.
+
 ## Recommended Response Pattern
 
 When the user says "connect Blender" or similar:

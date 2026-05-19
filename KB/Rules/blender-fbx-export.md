@@ -1,4 +1,4 @@
-# Blender FBX 导出规则
+# Blender 模型处理规则
 
 ## 导出前检查
 
@@ -44,3 +44,24 @@
 **导出完成后，必须立即删除上述垃圾文件，只保留目标 FBX/OBJ 文件。**
 
 此规则为强制规则，任何导出操作都必须执行清理，不得遗漏。
+
+## 减面规则（必须执行）
+
+当用户要求对模型进行减面并导出 OBJ（或其他格式）时，低模导入回 Blender 后**必须**与原模型在位置、缩放、旋转上完全一致，不允许更改任何 Transform 信息。
+
+### 具体要求
+
+1. **位置一致**：低模的 `location` 必须与原模型相同
+2. **旋转一致**：低模的 `rotation_euler` / `rotation_quaternion` 必须与原模型相同
+3. **缩放一致**：低模的 `scale` 必须与原模型相同
+4. **不允许任何 Transform 偏移**：即使 OBJ 导入导致轴系差异（如 Y/Z 互换），也必须通过修正旋转后 `apply_transform` 来对齐，最终结果必须是低模与原模型完全重合
+
+### 减面流程中的 Transform 对齐步骤
+
+1. 减面前：记录原模型的 `location`、`rotation_euler`、`scale`
+2. 减面后导入 OBJ：OBJ 导入可能产生轴系偏差（如长轴从 Z 变为 Y）
+3. 对齐修正：设置低模的 `location`/`rotation_euler`/`scale` 与原模型一致
+4. 应用变换：`bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)` 烘焙变换到顶点
+5. 验证：比较低模与原模型的世界空间包围盒（world bounding box），确认完全重合
+
+此规则为强制规则，任何减面操作都必须保证 Transform 一致性，不得遗漏验证步骤。

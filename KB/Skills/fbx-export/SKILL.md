@@ -9,6 +9,8 @@
 - 从 Blender 输出模型
 - 将物体转为 FBX 格式
 - 批量导出 FBX
+- 减面/简化模型后导出（OBJ/FBX）
+- LOD 制作
 
 ## 前置条件
 
@@ -64,6 +66,60 @@ export_fbx(
 | 纯几何无纹理 | `objects="name", embed_textures=False` |
 | 批量多物体 | `objects="obj1,obj2,obj3"` |
 | 全场景 | 不传 objects 参数 |
+
+## 减面流程
+
+当用户要求减面并导出 OBJ 时，必须执行以下流程，确保低模与原模型 Transform 完全一致。
+
+### 1. 记录原模型 Transform
+
+```python
+# 通过 BlenderMCP execute_code 记录原模型的位置/旋转/缩放
+src = bpy.data.objects["原模型名"]
+original_location = tuple(src.location)
+original_rotation = tuple(src.rotation_euler)
+original_scale = tuple(src.scale)
+```
+
+### 2. 导出 OBJ → 减面 → 导入回 Blender
+
+```bash
+# 导出 OBJ
+python3 Scripts/export_fbx.py --format obj <blend_file> --object <物体名>
+
+# pymeshlab 减面
+python3 Scripts/decimate.py outPut/<物体名>.obj --faces <目标面数> -o outPut/<物体名>_LOD.obj
+
+# 通过 BlenderMCP import_asset 导入低模 OBJ
+```
+
+### 3. 对齐 Transform（强制规则）
+
+低模导入后，**必须**将 location/rotation/scale 设置为与原模型完全一致：
+
+```python
+# OBJ 导入可能导致 Y/Z 轴互换，需要修正
+lod = bpy.data.objects["低模名"]
+lod.location = original_location
+lod.rotation_euler = original_rotation
+lod.scale = original_scale
+
+# 应用变换，烘焙到顶点数据
+bpy.context.view_layer.objects.active = lod
+lod.select_set(True)
+bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+```
+
+### 4. 验证 Transform 一致性（强制步骤）
+
+```python
+# 比较世界空间包围盒，确认低模与原模型完全重合
+src_bbox = src.matrix_world @ src.bound_box[i]  # 原模型8个顶点
+lod_bbox = lod.matrix_world @ lod.bound_box[i]  # 低模8个顶点
+# 所有对应顶点偏差应 < 0.001
+```
+
+**此步骤为强制规则，不允许跳过。低模必须与原模型在位置/缩放/旋转上完全重合。**
 
 ## 输出位置
 
