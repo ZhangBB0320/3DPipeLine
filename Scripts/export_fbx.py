@@ -132,12 +132,11 @@ def export_fbx(
     print(f"  应用变换: {'是' if apply_transforms else '否'}")
     print(f"  前轴/上轴: {forward}/{up}")
 
-    bpy.ops.export_scene.fbx(
+    # 构建 FBX 导出参数（兼容 Blender 3.x/4.x/5.x）
+    fbx_kwargs = dict(
         filepath=output_path,
         use_selection=only_selected,
         global_scale=scale,
-        use_armature=armature,
-        use_animation=animation,
         embed_textures=embed_textures,
         path_mode=path_mode,
         apply_scale_options='FBX_SCALE_ALL' if apply_transforms else 'FBX_SCALE_NONE',
@@ -145,6 +144,16 @@ def export_fbx(
         axis_up=up,
         object_types={'MESH', 'ARMATURE', 'EMPTY', 'LIGHT', 'CAMERA'} if armature else {'MESH', 'EMPTY', 'LIGHT', 'CAMERA'},
     )
+    # Blender 3.x/4.x 支持 use_armature/use_animation，Blender 5.x 已移除
+    try:
+        bpy.ops.export_scene.fbx(**fbx_kwargs)
+    except TypeError as e:
+        if 'use_armature' in str(e) or 'use_animation' in str(e):
+            fbx_kwargs.pop('use_armature', None)
+            fbx_kwargs.pop('use_animation', None)
+            bpy.ops.export_scene.fbx(**fbx_kwargs)
+        else:
+            raise
 
     file_size = Path(output_path).stat().st_size
     print(f"\n  导出完成! 文件大小: {file_size / 1024 / 1024:.2f} MB")
@@ -344,7 +353,7 @@ if __name__ == '__main__':
     parser.add_argument('--scale', type=float, default=1.0, help='全局缩放比例')
     parser.add_argument('--armature', action='store_true', help='导出骨骼')
     parser.add_argument('--animation', action='store_true', help='导出动画')
-    parser.add_argument('--no-embed-textures', dest='embed_textures', action='store_true', help='不内嵌纹理')
+    parser.add_argument('--no-embed-textures', dest='embed_textures', action='store_false', help='不内嵌纹理')
     parser.add_argument('--path-mode', default='COPY', choices=['COPY', 'AUTO', 'ABSOLUTE', 'RELATIVE'])
     parser.add_argument('--no-apply-transforms', dest='apply_transforms', action='store_false', help='不应用变换')
     parser.add_argument('--forward', default='-Z', help='前轴')
