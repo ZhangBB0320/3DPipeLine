@@ -1,6 +1,13 @@
-
 # Python cache
 Scripts/__pycache__/
 **/__pycache__/
 *.pyc
 
+# Output directory (baked textures, FBX, renders, etc.)
+outPut/
+
+# macOS
+.DS_Store
+
+# CodeBuddy
+.codebuddy/

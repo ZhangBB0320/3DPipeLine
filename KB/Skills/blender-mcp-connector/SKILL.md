@@ -112,39 +112,92 @@ For these integration tools, status checks are only needed once per session if t
 4. **Switching to alternative tools after one slow call.** First-call latency (cold start) is normal. Wait for the result.
 5. **Asking the user to re-confirm Blender state when they already confirmed.** Respect the user's stated context.
 
-## Critical: Stale Wrapper Process Pollution (Confirmed Root Cause)
+## Critical: Stable mcp.json Configuration (2026-05-19 重大升级)
 
-**Symptom**: `get_scene_info` / `get_viewport_screenshot` / `execute_blender_code` return empty strings or completely empty results, even though Blender is clearly running and the addon panel shows "Server Running".
+**旧配置（不稳定，已废弃）：**
+```json
+"blender": {
+  "command": "uvx",
+  "args": ["blender-mcp"],
+  "disabled": false
+}
+```
+问题：
+1. `uvx` 每次启动都重新解析 ephemeral 环境，启动慢（~0.85s）。
+2. 进程链层层嵌套：`uv tool uvx blender-mcp` → 内部又 spawn `uv tool uvx blender-mcp` → 最后才到 `python blender-mcp`。多个 PID。
+3. 缓存路径（`~/.cache/uv/archive-v0/<hash>/`）会被 uv GC，导致 wrapper 突然找不到 Python。
+4. 不同 CodeBuddy Plugin Helper 进程各自启动 wrapper，互相不知道，旧的不退出。
 
-**Root cause**: CodeBuddy spawns one `uvx blender-mcp` wrapper process **per Plugin Helper / per session**. When the user reloads CodeBuddy, opens new windows, or switches workspaces, **old wrappers are NOT cleaned up**. They keep an ESTABLISHED TCP connection to Blender's port 9876 forever.
-
-When CodeBuddy issues a new MCP request, it goes to the *current* wrapper, which forwards to Blender. Blender responds, but the response routing inside Blender's per-connection thread sometimes ends up on a stale connection's socket buffer. The current wrapper times out / returns empty.
-
-**Diagnostic command** (run in shell):
-
-```bash
-# Count wrapper processes (healthy: 1-2; unhealthy: 4+)
-ps -ef | grep -E "blender-mcp|blender_mcp" | grep -v grep | wc -l
-
-# Count ESTABLISHED connections to Blender (healthy: 1-2; unhealthy: 4+)
-lsof -i :9876 2>/dev/null | grep ESTAB | wc -l
+**新配置（稳定，已生效）：**
+```json
+"blender": {
+  "command": "/Users/zbb/.local/share/uv/tools/blender-mcp/bin/python",
+  "args": ["-m", "blender_mcp.server"],
+  "env": {
+    "PYTHONUNBUFFERED": "1",
+    "PYTHONDONTWRITEBYTECODE": "1"
+  },
+  "timeout": 120,
+  "disabled": false
+}
 ```
 
-If either count is ≥ 4, you have wrapper pollution.
-
-**Fix** (kills all wrappers; CodeBuddy auto-respawns clean ones in ~2s):
-
+**前置安装**（一次即可）：
 ```bash
-pkill -9 -f "blender-mcp"
-# Wait 2 seconds for CodeBuddy to respawn fresh wrappers
+uv tool install blender-mcp
+# 创建稳定路径 /Users/zbb/.local/share/uv/tools/blender-mcp/，独立 Python 3.12 venv
 ```
 
-After cleanup, the next `mcp_call_tool` invocation will work correctly.
+**优势：**
+- 启动 < 0.5s（直接 `python -m`，零中间层）。
+- 进程扁平：一个 Plugin Helper → 一个 python 进程。
+- 路径稳定，uv cache GC 不会失效。
+- `timeout: 120` 给长烘焙留出缓冲。
+- `PYTHONUNBUFFERED=1` 防 stdio 缓冲卡死。
+
+## Critical: Stale Wrapper Process Pollution (Persistent Issue)
+
+即使用了新配置，CodeBuddy 多 Plugin Helper 仍会各自 spawn wrapper（架构限制）。重载窗口/切 workspace 后旧 wrapper 不退出。
+
+**Symptom**: `get_scene_info` / `get_viewport_screenshot` / `execute_blender_code` 返回 `Request timed out` 或空结果。
+
+**Diagnostic（一键诊断）**：
+```bash
+bash /Users/zbb/3DPipeLine/Scripts/blender_mcp_doctor.sh
+```
+脚本输出：
+- Blender 进程数（应 = 1）
+- 9876 端口监听数（应 = 1）
+- wrapper 进程数（健康 1-2；污染 ≥4）
+- ESTABLISHED 连接数（健康 0-2；污染 ≥4）
+- blender-mcp 包安装状态
+
+**Fix（一键清理）**：
+```bash
+bash /Users/zbb/3DPipeLine/Scripts/blender_mcp_doctor.sh --fix
+# 等价于：pkill -9 -f "blender-mcp" 后 CodeBuddy 自动重建
+```
+
+## Critical: Long-Running Bake Operations Cause Timeout
+
+**根因**：`bpy.ops.object.bake()` 阻塞 Blender 主线程几十秒到几分钟。期间：
+- `blender-mcp` server 内部 socket 超时设为 180s，会一直等。
+- CodeBuddy → wrapper 的 stdio 默认超时约 30-60s，**先于** wrapper 报 timeout。
+- 但 Blender 那边可能还在烘！`bpy.ops` 完成时，wrapper 的 socket 已经被 CodeBuddy 关闭。
+
+**规则**：
+1. 任何 `bake()`、`smart_project()`、大模型 import/decimate 等耗时操作，**单独成一次 mcp 调用**。
+2. 一次只烘一张图（albedo / normal / roughness 分三次调用），不要在一个 `execute_blender_code` 里串行烘 3 张。
+3. samples 控制：bake 用 64 即可（128 太慢），device 优先 GPU。
+4. 调用前先打印 "BAKE START"，调用后打印 "BAKE DONE"，方便从 stderr 判断卡在哪。
+
+如果烘焙超时但 Blender 仍在运行，**不要重复调用** —— 等 1-2 分钟后用 `get_scene_info` 探活，再查烘焙图是否已经写盘 (`outPut/baked/*.png`)。
 
 **Prevention**:
 - Avoid opening multiple CodeBuddy windows on the same workspace.
-- After any CodeBuddy window reload (`Developer: Reload Window`), run the diagnostic and fix if needed before resuming Blender work.
+- After any CodeBuddy window reload (`Developer: Reload Window`), run the doctor and fix if needed before resuming Blender work.
 - If MCP starts misbehaving mid-session, run the fix command **first** before reporting "connection failed" to the user.
+- 长任务拆分多次小调用，每次 ≤ 30s。
 
 ## Recommended Response Pattern
 

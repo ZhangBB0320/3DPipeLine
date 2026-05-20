@@ -131,8 +131,11 @@ def process(input_path, output_base_dir, target_faces=3000):
 
     remesh_isotropic(ms, target_edge_len_pct=edge_pct, iterations=3)
 
-    # 阶段2.5: 补洞
-    close_holes(ms, max_hole_size=30)
+    # 阶段2.5: 补洞（可能因非流形边失败，跳过即可）
+    try:
+        close_holes(ms, max_hole_size=30)
+    except Exception as e:
+        print(f"    [WARN] close_holes skipped: {e}")
 
     # 阶段3: 减面
     decimate(ms, target_faces)

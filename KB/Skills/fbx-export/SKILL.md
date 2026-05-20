@@ -1,11 +1,11 @@
 ---
 name: fbx-export
-description: This skill covers the full pipeline from a textured high-poly Blender model to a baked, embedded-texture low-poly FBX. It activates whenever the user asks to export FBX, decimate a model, generate LODs, bake high-to-low (albedo / normal / roughness), or produce a low-poly FBX with embedded textures. The skill enforces transform-consistency rules during decimation, EMIT-based albedo baking for correct PBR colors, mandatory cleanup of companion files after export, and a single end-to-end SOP that has been validated on the wooden_handle_saber pipeline.
+description: This skill covers the full pipeline from a textured high-poly Blender model to a baked, embedded-texture low-poly FBX. It also covers the NoBake decimation pipeline for AI-generated buildings where baking is not needed (preserving original UV + textures). It activates whenever the user asks to export FBX, decimate a model, generate LODs, bake high-to-low (albedo / normal / roughness), produce a low-poly FBX with embedded textures, or process AI-generated building models. The skill enforces transform-consistency rules during decimation, EMIT-based albedo baking for correct PBR colors, mandatory cleanup of companion files after export, and a single end-to-end SOP that has been validated on the wooden_handle_saber pipeline.
 ---
 
 # FBX Export & High-to-Low Bake Skill
 
-将 Blender 场景中的物体导出为 FBX；或执行完整的 **「减面 → 烘焙 → 低模内嵌纹理 FBX」** 流水线。
+将 Blender 场景中的物体导出为 FBX；或执行完整的 **「减面 → 烘焙 → 低模内嵌纹理 FBX」** 流水线；或对 AI 生成的建筑模型执行 **「NoBake 减面」** 流水线（保留原始 UV + 纹理，不烘焙）。
 
 ## 触发条件
 
@@ -15,6 +15,7 @@ description: This skill covers the full pipeline from a textured high-poly Blend
 - 高模烘焙到低模；烘 albedo / normal / roughness
 - 生成带烘焙纹理的低模 FBX
 - 整套 "高模 → 低模 → 内嵌纹理 FBX" 流程
+- **AI 建筑模型减面 / 批量建筑减面 / NoBake 减面**（保留 UV 不烘焙）
 
 ---
 
@@ -42,7 +43,7 @@ description: This skill covers the full pipeline from a textured high-poly Blend
 │                                                              │
 │ 9. 建立低模 BSDF 节点树：tex_coord→mapping→3 图→BSDF→输出      │
 │                                                              │
-│ 10. Cycles 引擎 + use_selected_to_active=True + cage=1.5    │
+│ 10. Cycles 引擎 + use_selected_to_active=True + cage=1.0    │
 │                                                              │
 │ 11. ⚠️ 烘焙 albedo 用 EMIT 法（临时接 Emission，不用 DIFFUSE） │
 │ 12. 烘焙 normal（NORMAL 类型，默认参数）                       │
@@ -293,7 +294,7 @@ def bake_albedo_via_emit(high_obj, low_obj, target_image_node):
     scn = bpy.context.scene
     scn.cycles.bake_type = 'EMIT'
     scn.render.bake.use_selected_to_active = True
-    scn.render.bake.cage_extrusion = 1.5
+    scn.render.bake.cage_extrusion = 1.0
     bpy.ops.object.bake(type='EMIT')
 
     # 还原
@@ -318,7 +319,7 @@ def bake_standard(high_obj, low_obj, target_image_node, bake_type):
     scn = bpy.context.scene
     scn.cycles.bake_type = bake_type
     scn.render.bake.use_selected_to_active = True
-    scn.render.bake.cage_extrusion = 1.5
+    scn.render.bake.cage_extrusion = 1.0
     bpy.ops.object.bake(type=bake_type)
 ```
 
@@ -326,12 +327,12 @@ def bake_standard(high_obj, low_obj, target_image_node, bake_type):
 
 ```python
 scn.render.engine = 'CYCLES'
-scn.cycles.device = 'CPU'        # 或 'GPU' 加速
-scn.cycles.samples = 128
+scn.cycles.device = 'GPU'        # 优先 GPU 加速
+scn.cycles.samples = 64
 
 bake = scn.render.bake
 bake.use_selected_to_active = True   # 必须勾「所选 → 活动」
-bake.cage_extrusion = 1.5            # 挤出 1.5m（人物模型；小物件可调小到 0.1-0.3）
+bake.cage_extrusion = 1.0            # 挤出 1.0（2026-05-20 实测：≥0.5 对建筑无差异，0.1 漏射偏暗）
 bake.use_cage = False                # 不用单独的笼体物体
 ```
 
@@ -361,8 +362,8 @@ LOW_NAME  = 'saber_Low'               # 低模名称
 MAT_NAME  = 'bake_saber'              # 低模材质名
 BAKE_PREFIX = 'bake_saber'            # 烘焙图前缀
 TARGET_FACES = 1000                   # 目标面数
-RESOLUTION = 2048                     # 烘焙图分辨率
-CAGE = 1.5                            # 挤出（小物件可调小）
+RESOLUTION = 4096                     # 烘焙图分辨率（2026-05-20 实测：4K 明显优于 2K/1K）
+CAGE = 1.0                            # 挤出（≥0.5 对建筑无差异，0.1 漏射偏暗）
 OUT_DIR = '/Users/zbb/3DPipeLine/outPut'
 BAKE_DIR = f'{OUT_DIR}/baked'
 os.makedirs(BAKE_DIR, exist_ok=True)
@@ -438,7 +439,7 @@ scn.render.engine = 'CYCLES'
 scn.cycles.device = 'CPU'
 scn.cycles.samples = 128
 scn.render.bake.use_selected_to_active = True
-scn.render.bake.cage_extrusion = CAGE
+scn.render.bake.cage_extrusion = CAGE  # 1.0
 scn.render.bake.use_cage = False
 
 # === 11-13. 烘焙 ===
@@ -486,3 +487,112 @@ export_fbx.export_fbx(objects=LOW_NAME, scale=1.0,
 5. **导出后输出目录有 .mtl/.png 散落**：`export_fbx.py` 已内置自动清理；如残留说明清理函数被绕过
 6. **烘焙后低模在材质预览下偏黑**：参考 "高模烘焙到低模流程" → 故障排查表
 7. **MCP 返回空响应**：参考 `KB/Skills/blender-mcp-connector/SKILL.md` 的「Stale Wrapper Process Pollution」清污 SOP
+
+---
+
+## NoBake 减面流程（AI 生成建筑模型专用）
+
+### 适用场景
+
+- AI 生成的建筑模型（单 mesh，~50K 面）
+- 目标：3K 面低模，用于 PC 游戏（非交互建筑）
+- **核心问题**：94% 减面率下 Quadric Edge Collapse 会吃掉招牌等薄面片 → 烘焙射线未命中 → 黑色纹理块
+- **核心方案**：减面时保留原始 UV，减面后直接使用原始 4096×4096 纹理，**跳过烘焙**
+
+### 方案对比
+
+| 方案 | 黑块问题 | UV 扭曲 | 流程复杂度 | 适用场景 |
+|------|---------|---------|-----------|---------|
+| **NoBake（推荐）** | ✅ 无（0%） | ~10% 面有极端拉伸 | 低（1 步） | AI 建筑等不需要精确拓扑的远景模型 |
+| Baked（传统） | ❌ 有黑块 | ✅ 无（重新 UV） | 高（7+ 步） | 武器/角色等需要精确纹理的近景模型 |
+
+### 端到端 SOP（NoBake）
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│ 1. 导入原始 FBX（含材质和纹理）                                  │
+│                                                               │
+│ 2. Blender Decimate 修改器，ratio = target / current            │
+│    保留原始 UV，不重新展开                                       │
+│                                                               │
+│ 3. 解包纹理到输出目录（packed → 本地文件）                        │
+│                                                               │
+│ 4. 导出 FBX（path_mode='COPY'）                                 │
+│    → <name>/<name>_3k.fbx + <name>_3k.fbm/*.png               │
+│                                                               │
+│ 5. 可选：EEVEE 渲染高模 vs 低模对比图                            │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 一键运行
+
+```bash
+# 单个模型
+bash Scripts/batch_nobake.sh /path/to/model.fbx 3000
+
+# 批量目录
+bash Scripts/batch_nobake.sh /path/to/fbx_dir/ 3000
+
+# 默认（~/Downloads/Building/ 下所有 FBX）
+bash Scripts/batch_nobake.sh
+```
+
+底层调用 Blender 命令行模式：
+```bash
+/Applications/Blender.app/Contents/MacOS/Blender --background \
+    --python Scripts/nobake_decimate.py -- \
+    --input /path/to/model.fbx \
+    --output outPut/ \
+    --target 3000 \
+    --render
+```
+
+### 输出结构
+
+```
+outPut/<model_name>/
+  <model_name>_3k.fbx          # 低模 FBX
+  <model_name>_3k.fbm/          # FBX 纹理伴侣目录（Unity/UE 自动识别）
+    texture_pbr_xxx.png         # albedo
+    texture_pbr_xxx_normal.png  # normal
+    texture_pbr_xxx_roughness.png
+    texture_pbr_xxx_metallic.png
+  <model_name>_compare.png      # 高模 vs 低模对比渲染图（--render 时）
+```
+
+### Blender 5.1 FBX 导出参数（已验证）
+
+```python
+bpy.ops.export_scene.fbx(
+    filepath=fbx_path,
+    use_selection=True,
+    path_mode='COPY',       # 复制纹理到 .fbm 目录
+    embed_textures=False,   # Blender FBX 嵌入不可靠，用 COPY
+    mesh_smooth_type='FACE',
+    use_mesh_modifiers=False,
+    axis_forward='-Z',
+    axis_up='Y',
+    primary_bone_axis='Y',
+    secondary_bone_axis='X',
+)
+```
+
+**注意**：Blender 5.1 移除了 `apply_modifiers` 和 `copy_substitute` 参数，使用时会报 TypeError。
+
+### UV 扭曲分析
+
+94% 减面率下 UV 扭曲数据（Building1 实测）：
+- 极端拉伸面：~10%（3K 面中约 300 面）
+- 极端压缩面：~0%
+- **权衡**：10% 面有 UV 拉伸 vs 0% 黑块。对远景建筑完全可接受。
+
+### 故障排查（NoBake 专用）
+
+| 现象 | 原因 / 修复 |
+|------|------------|
+| FBX 极小（<10KB） | 纹理未解包或导出参数错误 → 检查 unpack_textures 输出 |
+| 纹理目录为空 | packed 纹理解包失败 → 用 `img.save()` 作为回退 |
+| 导出报 TypeError | Blender 5.1 API 变更 → 移除 `apply_modifiers`、`copy_substitute` |
+| .fbm 目录有纹理但引擎不识别 | 确认 .fbm 与 .fbx 同级同名（如 `model_3k.fbx` + `model_3k.fbm/`） |
+| 渲染图全黑 | 场景无灯光 → 脚本自动设置 World 背景光 |
+| 减面后 UV 全乱 | ratio 过小 → Building1 在 ratio=0.0566 下仍有可接受的 UV |
