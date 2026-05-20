@@ -30,32 +30,21 @@ description: This skill covers the full pipeline from a textured high-poly Blend
 │ 3. pymeshlab 减面 → outPut/<日期>/<name>.obj                  │
 │    Scripts/decimate.py                                       │
 │                                                              │
-│ 4. 导入低模 OBJ → 重命名 saber_Low                            │
+│ 4. 导入低模 OBJ → 重命名 <name>_Low                           │
 │    bpy.ops.wm.obj_import(forward=-Z, up=Y)                   │
 │                                                              │
 │ 5. ⚠️ 修复 Y/Z 轴互换：rotation_euler=(π/2,0,0) → 应用变换     │
 │                                                              │
 │ 6. ✅ 验证 BBox：低模与高模世界空间偏差应仅为减面误差          │
 │                                                              │
-│ 7. Smart UV Project（保证无重叠）                             │
+│ 7. 调用 bake_high_to_low() 一键烘焙 Albedo+Normal              │
+│    Scripts/bake.py（⚠️ 唯一默认烘焙脚本，禁止手写内联烘焙代码） │
 │                                                              │
-│ 8. 创建 3 张烘焙图（白色/法线蓝/中灰底色，禁黑色）             │
+│ 8. 导出低模为内嵌纹理 FBX：embed_textures=True, COPY 模式    │
 │                                                              │
-│ 9. 建立低模 BSDF 节点树：tex_coord→mapping→3 图→BSDF→输出      │
-│                                                              │
-│ 10. Cycles 引擎 + use_selected_to_active=True + cage=1.0    │
-│                                                              │
-│ 11. ⚠️ 烘焙 albedo 用 EMIT 法（临时接 Emission，不用 DIFFUSE） │
-│ 12. 烘焙 normal（NORMAL 类型，默认参数）                       │
-│ 13. 烘焙 roughness（ROUGHNESS 类型，默认参数）                 │
-│                                                              │
-│ 14. 导出低模为内嵌纹理 FBX：embed_textures=True, COPY 模式    │
-│                                                              │
-│ 15. 强制清理伴随的 .mtl / 散落的 .png/.jpg/.exr 等            │
+│ 9. 强制清理伴随的 .mtl / 散落的 .png/.jpg/.exr 等            │
 └─────────────────────────────────────────────────────────────┘
 ```
-
-整套流程在 `wooden_handle_saber` 案例上已端到端验证（4031 面 → 978 面，BBox 偏差 0.005m，4.35 MB 内嵌纹理 FBX）。
 
 ---
 
@@ -169,185 +158,117 @@ print(f'BBox max diff: {max_diff:.6f}')
 
 ---
 
-## 高模烘焙到低模流程
+## 高模烘焙到低模流程（⚠️ 必须使用 bake.py 脚本）
 
-减面 + 对齐完成后，进行高→低烘焙。
+**强制规则：所有烘焙操作必须通过 `Scripts/bake.py` 的 `bake_high_to_low()` 函数执行，禁止手写内联烘焙代码。**
 
-### 1. Smart UV Project（保证 UV 不重叠）
+### 为什么必须用 bake.py
+
+`bake.py` 封装了以下经过实测验证的关键逻辑，手写极易遗漏：
+
+| 功能 | 手写风险 | bake.py 处理 |
+|------|---------|-------------|
+| Albedo 烘焙 | DIFFUSE → 金属全黑 | ✅ EMIT 法，自动备份/还原高模材质 |
+| 保存烘焙图 | `save()` 保存 generated_color；`save_render()` 视图变换偏色；`pack+save()` 4K 不稳定 | ✅ `img.pixels → numpy linear→sRGB → struct+zlib PNG` |
+| 烘焙图底色 | 黑底 → UV 缝黑边 | ✅ 白色/法线蓝/中灰底色 + `img.scale()` 强制刷新 |
+| 材质校验 | 默认紫色材质 → 烘焙全黑 | ✅ `_validate_high_material()` 前置校验 |
+| UV 校验 | 无 UV → 烘焙全白 | ✅ `_validate_uv()` 前置校验 |
+| BBox 对齐 | 高低模错位 → 烘焙偏暗 | ✅ `_validate_bbox_alignment()` 校验 |
+| 旋转对齐 | OBJ 轴向不一致 | ✅ `_align_low_to_high()` 自动中心匹配 + 24 旋转搜索 |
+
+### 用法一：Blender 内部模式（MCP / Scripting）
 
 ```python
-bpy.ops.object.mode_set(mode='EDIT')
-bpy.ops.mesh.select_all(action='SELECT')
-bpy.ops.uv.smart_project(angle_limit=1.15191, island_margin=0.02)
-bpy.ops.object.mode_set(mode='OBJECT')
+import sys
+sys.path.insert(0, '/Users/zbb/3DPipeLine/Scripts')
+from bake import bake_high_to_low
+
+alb_path, norm_path = bake_high_to_low(
+    high_fbx="/path/to/high.fbx",
+    low_obj="/path/to/low.obj",
+    out_dir="/path/to/output",
+    name="MyModel",       # 烘焙贴图前缀
+    cage=1.0,             # 建筑 1.0，小物件/武器 0.2
+    res=4096,             # 4K（2026-05-20 实测 4K >> 2K/1K）
+    samples=64,           # 64 即可
+    device="GPU",         # 优先 GPU
+)
+# 返回: (albedo_png_path, normal_png_path)
 ```
 
-### 2. 创建 3 张烘焙图（强制非黑底色）
+### 用法二：Blender CLI 模式（后台批处理）
 
-UV 岛之间的 padding 区域显示底色，**黑底会导致整体偏暗 + UV 缝出现黑边**。
-
-```python
-def make_bake_image(name, colorspace, gen_color, is_data=False):
-    img = bpy.data.images.new(name, 2048, 2048, alpha=False, is_data=is_data)
-    img.colorspace_settings.name = colorspace
-    img.generated_color = gen_color
-    img.scale(img.size[0], img.size[1])  # 强制把底色刷到像素
-    img.filepath_raw = f'/Users/zbb/3DPipeLine/outPut/baked/{name}.png'
-    img.file_format = 'PNG'
-    return img
-
-img_alb   = make_bake_image('bake_<name>_albedo',    'sRGB',      (1.0, 1.0, 1.0, 1.0), is_data=False)
-img_norm  = make_bake_image('bake_<name>_norm',      'Non-Color', (0.5, 0.5, 1.0, 1.0), is_data=True)
-img_rough = make_bake_image('bake_<name>_roughness', 'Non-Color', (0.5, 0.5, 0.5, 1.0), is_data=True)
+```bash
+/Applications/Blender.app/Contents/MacOS/Blender --background --python Scripts/bake.py -- \
+    --high_fbx /path/to/high.fbx \
+    --low_obj /path/to/low.obj \
+    --out_dir /path/to/output \
+    --name MyModel \
+    --cage 1.0 \
+    --res 4096 \
+    --samples 64 \
+    --device GPU
 ```
 
-| 贴图 | 色彩空间 | is_data | 底色 |
-|------|---------|---------|------|
-| albedo | sRGB | False | (1,1,1,1) 白 |
-| norm | Non-Color | True | (0.5,0.5,1,1) 法线蓝 |
-| roughness | Non-Color | True | (0.5,0.5,0.5,1) 中灰 |
-
-### 3. 建立低模 BSDF 节点树
+### 用法三：通过 MCP execute_code 调用
 
 ```python
-mat = bpy.data.materials.new('bake_<name>')
-mat.use_nodes = True
-nt = mat.node_tree
-for n in list(nt.nodes): nt.nodes.remove(n)
+# 在 execute_blender_code 中执行
+import sys
+sys.path.insert(0, '/Users/zbb/3DPipeLine/Scripts')
+from bake import bake_high_to_low
 
-# 节点链：texcoord → mapping → 3 个 image → (norm 经 NormalMap) → BSDF → Output
-tex_coord = nt.nodes.new('ShaderNodeTexCoord')
-mapping   = nt.nodes.new('ShaderNodeMapping')
-nt.links.new(tex_coord.outputs['UV'], mapping.inputs['Vector'])
-
-n_alb   = nt.nodes.new('ShaderNodeTexImage'); n_alb.image = img_alb;   n_alb.label = 'albedo'
-n_norm  = nt.nodes.new('ShaderNodeTexImage'); n_norm.image = img_norm; n_norm.label = 'norm'
-n_rough = nt.nodes.new('ShaderNodeTexImage'); n_rough.image = img_rough; n_rough.label = 'roughness'
-for n in (n_alb, n_norm, n_rough):
-    nt.links.new(mapping.outputs['Vector'], n.inputs['Vector'])
-
-n_normmap = nt.nodes.new('ShaderNodeNormalMap'); n_normmap.space = 'TANGENT'
-nt.links.new(n_norm.outputs['Color'], n_normmap.inputs['Color'])
-
-bsdf = nt.nodes.new('ShaderNodeBsdfPrincipled')
-out  = nt.nodes.new('ShaderNodeOutputMaterial')
-nt.links.new(n_alb.outputs['Color'], bsdf.inputs['Base Color'])
-nt.links.new(n_rough.outputs['Color'], bsdf.inputs['Roughness'])
-nt.links.new(n_normmap.outputs['Normal'], bsdf.inputs['Normal'])
-nt.links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
-
-low.data.materials.clear()
-low.data.materials.append(mat)
+alb, norm = bake_high_to_low(
+    high_fbx="/Users/zbb/3DPipeLine/outPut/model.fbx",
+    low_obj="/Users/zbb/3DPipeLine/outPut/2026-05-21/model.obj",
+    out_dir="/Users/zbb/3DPipeLine/outPut/baked",
+    name="model",
+)
+print(f"Albedo: {alb}")
+print(f"Normal: {norm}")
 ```
 
-### 4. ⚠️ Albedo 必须用 EMIT 烘焙法（强制规则）
+**⚠️ MCP 长任务规则**：`bake_high_to_low()` 内部包含两次 `bpy.ops.object.bake()` 调用（Albedo + Normal），总耗时可能 30-120 秒。如遇 MCP 超时，**不要重复调用**——等 1-2 分钟后用 `get_scene_info` 探活，再检查输出目录是否已有 PNG 文件。
 
-**绝对禁止用 DIFFUSE 烘焙 albedo / base color，无论金属/非金属一律用 EMIT。**
-
-为什么 DIFFUSE+只勾颜色不可靠：
-
-| 材质类型 | DIFFUSE+只勾颜色结果 | EMIT 结果 |
-|---------|------------------|----------|
-| 纯金属（Metallic=1）| **全黑**（金属漫反射通道恒等于 0）| ✅ 正确 |
-| 带 SSS 皮肤 | 偏色（混入次表面散射）| ✅ 正确 |
-| 带 Sheen 布料/丝绸 | 颜色被光泽层衰减 | ✅ 正确 |
-| 带 Coat 清漆 | 颜色被清漆层衰减 | ✅ 正确 |
-| 普通非金属（纯漫反射）| 与 EMIT 等价 | ✅ 正确 |
-
-EMIT 法是 Substance Painter / Marmoset Toolbag / Bake Wrangler 等业界烘焙工具的底层做法：直接采样 base color 节点输出，不经过 PBR 物理计算，无论材质多复杂都得到原始基础色。
+### 烘焙统一参数（强制）
 
 ```python
-def bake_albedo_via_emit(high_obj, low_obj, target_image_node):
-    """通过临时 Emission 节点烘 base color，自动还原"""
-    mat_h = high_obj.material_slots[0].material
-    nt = mat_h.node_tree
-    bsdf = next(n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED')
-    output = next(n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL')
-
-    # 备份
-    bc_input = bsdf.inputs['Base Color']
-    bc_src = bc_input.links[0].from_socket if bc_input.is_linked else None
-    bc_default = tuple(bc_input.default_value)
-    surf_input = output.inputs['Surface']
-    orig_surf_src = surf_input.links[0].from_socket if surf_input.is_linked else None
-
-    # 临时 Emission
-    emit = nt.nodes.new('ShaderNodeEmission')
-    emit.label = '__bake_tmp__'
-    if bc_src:
-        nt.links.new(bc_src, emit.inputs['Color'])
-    else:
-        emit.inputs['Color'].default_value = bc_default
-    for link in list(surf_input.links): nt.links.remove(link)
-    nt.links.new(emit.outputs['Emission'], surf_input)
-
-    # 选中物体 + 选中目标图像节点
-    bpy.ops.object.select_all(action='DESELECT')
-    high_obj.select_set(True); low_obj.select_set(True)
-    bpy.context.view_layer.objects.active = low_obj
-    low_nt = low_obj.data.materials[0].node_tree
-    for n in low_nt.nodes: n.select = False
-    target_image_node.select = True
-    low_nt.nodes.active = target_image_node
-
-    # 烘焙
-    scn = bpy.context.scene
-    scn.cycles.bake_type = 'EMIT'
-    scn.render.bake.use_selected_to_active = True
-    scn.render.bake.cage_extrusion = 1.0
-    bpy.ops.object.bake(type='EMIT')
-
-    # 还原
-    for link in list(surf_input.links): nt.links.remove(link)
-    if orig_surf_src: nt.links.new(orig_surf_src, surf_input)
-    nt.nodes.remove(emit)
-```
-
-### 5. Normal / Roughness 用标准烘焙
-
-```python
-def bake_standard(high_obj, low_obj, target_image_node, bake_type):
-    """bake_type ∈ {'NORMAL', 'ROUGHNESS'}"""
-    bpy.ops.object.select_all(action='DESELECT')
-    high_obj.select_set(True); low_obj.select_set(True)
-    bpy.context.view_layer.objects.active = low_obj
-    low_nt = low_obj.data.materials[0].node_tree
-    for n in low_nt.nodes: n.select = False
-    target_image_node.select = True
-    low_nt.nodes.active = target_image_node
-
-    scn = bpy.context.scene
-    scn.cycles.bake_type = bake_type
-    scn.render.bake.use_selected_to_active = True
-    scn.render.bake.cage_extrusion = 1.0
-    bpy.ops.object.bake(type=bake_type)
-```
-
-### 6. 三种烘焙的统一参数（强制）
-
-```python
-scn.render.engine = 'CYCLES'
-scn.cycles.device = 'GPU'        # 优先 GPU 加速
-scn.cycles.samples = 64
-
-bake = scn.render.bake
-bake.use_selected_to_active = True   # 必须勾「所选 → 活动」
-bake.cage_extrusion = 1.0            # 挤出 1.0（2026-05-20 实测：≥0.5 对建筑无差异，0.1 漏射偏暗）
-bake.use_cage = False                # 不用单独的笼体物体
+# bake.py 内部默认值，无需手动设置
+DEFAULT_CAGE     = 1.0    # 建筑 cage；小物件/武器用 0.2
+DEFAULT_RES      = 4096   # 4K
+DEFAULT_SAMPLES  = 64
+DEFAULT_DEVICE   = "GPU"  # 优先 GPU
 ```
 
 **选择顺序**：先选高模，加选低模，活动物体 = 低模；并在低模材质里选中要烘焙的目标图像节点。
 
-### 7. 故障排查
+### bake_high_to_low() 完整流程
+
+1. 导入高模 FBX（含纹理）→ 合并多 mesh → apply transform → 材质校验
+2. 导入低模 OBJ → apply transform
+3. 对齐低模到高模（`_align_low_to_high`：中心匹配 + 24 旋转搜索）
+4. BBox 校验
+5. Smart UV Project（`skip_uv=True` 可跳过）
+6. 创建烘焙图（白色/法线蓝底色，4096×4096）
+7. 建立低模 BSDF 节点树（tex_coord → mapping → albedo/normal image → BSDF → Output）
+8. Cycles GPU + use_selected_to_active + cage=1.0
+9. 烘焙 Albedo（EMIT 法：备份→临时 Emission→烘焙→还原）
+10. 烘焙 Normal（NORMAL 类型）
+11. 保存贴图（`_save_bake_image`：numpy linear→sRGB → struct+zlib PNG）
+12. 清理场景中的高低模和孤立数据
+
+### 故障排查
 
 | 现象 | 原因 / 修复 |
 |------|------------|
-| 烘焙结果整体偏黑 / 暗 | albedo 用了 DIFFUSE → 强制改 EMIT |
-| UV 缝处有黑边 | 烘焙图底色是黑色 → 重建图像，按上表设置非黑底色 |
-| 法线贴图烘出来失真 | 检查低模 NormalMap 节点 Space=Tangent + norm 图像 colorspace=Non-Color |
-| 粗糙度全黑/全白 | 高模 BSDF Roughness 输入未连贴图（用了默认值），单色属正常 |
+| 烘焙结果整体偏黑 / 暗 | albedo 用了 DIFFUSE → bake.py 默认用 EMIT，不会出现此问题 |
+| UV 缝处有黑边 | 烘焙图底色是黑色 → bake.py 默认白底/法线蓝底 |
+| 保存的贴图全黑 / 偏暗 | `save()`/`save_render()` bug → bake.py 用 `_save_bake_image()` 手动写 PNG |
+| 法线贴图失真 | 检查 NormalMap 节点 Space=Tangent + norm 图像 colorspace=Non-Color |
+| 粗糙度全黑/全白 | 高模 BSDF Roughness 输入未连贴图，单色属正常 |
 | "无有效的选中物体" | 高模/低模被 hide → `obj.hide_viewport=False; obj.hide_set(False)` |
-| 烘焙后高模材质坏掉 | 临时 Emission 节点未清理 → 检查 `[n for n in nt.nodes if n.type=='EMISSION']` 并移除 `__bake_tmp__` |
+| 烘焙后高模材质坏掉 | 临时 Emission 节点未清理 → bake.py 自动还原 |
+| 高模默认紫色材质报错 | 材质未正确加载 → `_validate_high_material()` 前置拦截 |
 
 ---
 
@@ -357,13 +278,8 @@ bake.use_cage = False                # 不用单独的笼体物体
 import bpy, sys, os, math, mathutils
 
 # === 配置 ===
-HIGH_NAME = 'saber_High'              # 高模名称
-LOW_NAME  = 'saber_Low'               # 低模名称
-MAT_NAME  = 'bake_saber'              # 低模材质名
-BAKE_PREFIX = 'bake_saber'            # 烘焙图前缀
-TARGET_FACES = 1000                   # 目标面数
-RESOLUTION = 4096                     # 烘焙图分辨率（2026-05-20 实测：4K 明显优于 2K/1K）
-CAGE = 1.0                            # 挤出（≥0.5 对建筑无差异，0.1 漏射偏暗）
+HIGH_NAME = 'saber_High'
+TARGET_FACES = 1000
 OUT_DIR = '/Users/zbb/3DPipeLine/outPut'
 BAKE_DIR = f'{OUT_DIR}/baked'
 os.makedirs(BAKE_DIR, exist_ok=True)
@@ -377,7 +293,7 @@ high_obj_path = f'{OUT_DIR}/{HIGH_NAME}.obj'
 bpy.ops.wm.obj_export(filepath=high_obj_path, export_selected_objects=True,
                       forward_axis='NEGATIVE_Z', up_axis='Y')
 
-# === 3. 减面（外部进程，使用 workbuddy 的 python） ===
+# === 3. 减面（外部进程） ===
 import subprocess
 subprocess.run([
     '/Users/zbb/.workbuddy/binaries/python/versions/3.14.3/bin/python3',
@@ -394,7 +310,7 @@ low_obj_path = str(date_dirs[-1] / f'{HIGH_NAME}.obj')
 bpy.ops.object.select_all(action='DESELECT')
 bpy.ops.wm.obj_import(filepath=low_obj_path, forward_axis='NEGATIVE_Z', up_axis='Y')
 low = bpy.context.selected_objects[0]
-low.name = LOW_NAME
+low.name = 'saber_Low'
 low.location = high.location[:]
 low.rotation_euler = high.rotation_euler[:]
 low.scale = high.scale[:]
@@ -411,58 +327,39 @@ low_bb  = [low.matrix_world  @ mathutils.Vector(c) for c in low.bound_box]
 max_diff = max((high_bb[i]-low_bb[i]).length for i in range(8))
 print(f'BBox max diff: {max_diff:.6f}')
 
-# === 7. Smart UV ===
-bpy.ops.object.mode_set(mode='EDIT')
-bpy.ops.mesh.select_all(action='SELECT')
-bpy.ops.uv.smart_project(angle_limit=1.15191, island_margin=0.02)
-bpy.ops.object.mode_set(mode='OBJECT')
-
-# === 8. 创建烘焙图 ===
-def make_img(name, cs, color, is_data=False):
-    img = bpy.data.images.new(name, RESOLUTION, RESOLUTION, alpha=False, is_data=is_data)
-    img.colorspace_settings.name = cs
-    img.generated_color = color
-    img.scale(img.size[0], img.size[1])
-    img.filepath_raw = f'{BAKE_DIR}/{name}.png'
-    img.file_format = 'PNG'
-    return img
-img_alb   = make_img(f'{BAKE_PREFIX}_albedo',    'sRGB',      (1,1,1,1), False)
-img_norm  = make_img(f'{BAKE_PREFIX}_norm',      'Non-Color', (0.5,0.5,1,1), True)
-img_rough = make_img(f'{BAKE_PREFIX}_roughness', 'Non-Color', (0.5,0.5,0.5,1), True)
-
-# === 9. 建立低模 BSDF 节点树（省略，参见上文） ===
-# ... 省略，按 "建立低模 BSDF 节点树" 节代码 ...
-
-# === 10. Cycles 配置 ===
-scn = bpy.context.scene
-scn.render.engine = 'CYCLES'
-scn.cycles.device = 'CPU'
-scn.cycles.samples = 128
-scn.render.bake.use_selected_to_active = True
-scn.render.bake.cage_extrusion = CAGE  # 1.0
-scn.render.bake.use_cage = False
-
-# === 11-13. 烘焙 ===
-nt_low = low.data.materials[0].node_tree
-n_alb   = next(n for n in nt_low.nodes if n.label=='albedo')
-n_norm  = next(n for n in nt_low.nodes if n.label=='norm')
-n_rough = next(n for n in nt_low.nodes if n.label=='roughness')
-
-bake_albedo_via_emit(high, low, n_alb)
-bake_standard(high, low, n_norm,  'NORMAL')
-bake_standard(high, low, n_rough, 'ROUGHNESS')
-
-# 保存
-for img in (img_alb, img_norm, img_rough):
-    img.save_render(img.filepath_raw)
-
-# === 14-15. 导出内嵌纹理 FBX + 自动清理 ===
+# === 7. 烘焙（使用 bake.py，禁止手写内联烘焙代码） ===
 sys.path.insert(0, '/Users/zbb/3DPipeLine/Scripts')
-import importlib, export_fbx; importlib.reload(export_fbx)
-export_fbx.export_fbx(objects=LOW_NAME, scale=1.0,
-                      armature=False, animation=False,
-                      embed_textures=True, path_mode='COPY')
-# → outPut/saber_Low.fbx (内嵌 3 张 PNG)
+from bake import bake_high_to_low
+
+# 导出高模为 FBX（bake_high_to_low 需要 FBX 输入）
+high_fbx_path = f'{OUT_DIR}/{HIGH_NAME}.fbx'
+bpy.ops.object.select_all(action='DESELECT')
+high.select_set(True)
+bpy.ops.export_scene.fbx(
+    filepath=high_fbx_path, use_selection=True,
+    path_mode='COPY', embed_textures=True,
+    mesh_smooth_type='FACE',
+    axis_forward='-Z', axis_up='Y',
+)
+
+alb_path, norm_path = bake_high_to_low(
+    high_fbx=high_fbx_path,
+    low_obj=low_obj_path,
+    out_dir=BAKE_DIR,
+    name='saber',
+    cage=1.0,
+    res=4096,
+    samples=64,
+    device='GPU',
+)
+print(f'Albedo: {alb_path}')
+print(f'Normal: {norm_path}')
+
+# === 8-9. 导出内嵌纹理 FBX + 自动清理 ===
+from export_fbx import export_fbx
+export_fbx(objects='saber_Low', scale=1.0,
+           armature=False, animation=False,
+           embed_textures=True, path_mode='COPY')
 ```
 
 ---
@@ -473,7 +370,7 @@ export_fbx.export_fbx(objects=LOW_NAME, scale=1.0,
 |------|------|
 | 高模 OBJ（中间产物）| `outPut/<name>_High.obj` |
 | 低模 OBJ（减面结果）| `outPut/<日期>/<name>_High.obj` |
-| 烘焙图 | `outPut/baked/bake_<name>_albedo.png` 等 |
+| 烘焙图 | `outPut/baked/bake_<name>_albedo.png` / `bake_<name>_normal.png` |
 | **最终低模 FBX** | `outPut/<name>_Low.fbx` ← 含内嵌烘焙纹理 |
 
 ---
@@ -485,8 +382,9 @@ export_fbx.export_fbx(objects=LOW_NAME, scale=1.0,
 3. **导入引擎后比例错误**：调整 scale 参数（Unity=0.01）
 4. **骨骼未导出**：确认 armature=True 且骨骼是物体父级
 5. **导出后输出目录有 .mtl/.png 散落**：`export_fbx.py` 已内置自动清理；如残留说明清理函数被绕过
-6. **烘焙后低模在材质预览下偏黑**：参考 "高模烘焙到低模流程" → 故障排查表
-7. **MCP 返回空响应**：参考 `KB/Skills/blender-mcp-connector/SKILL.md` 的「Stale Wrapper Process Pollution」清污 SOP
+6. **烘焙后低模在材质预览下偏黑**：确认使用了 `bake.py` 而非手写烘焙代码
+7. **MCP 返回空响应**：参考 `blender-mcp-connector` SKILL.md 的「Stale Wrapper Process Pollution」清污 SOP
+8. **保存的贴图偏色/全黑**：确认使用了 `bake.py` 的 `_save_bake_image()` 而非 `img.save()` / `img.save_render()`
 
 ---
 

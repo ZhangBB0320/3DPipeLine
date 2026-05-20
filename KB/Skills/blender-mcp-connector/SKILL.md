@@ -199,6 +199,75 @@ bash /Users/zbb/3DPipeLine/Scripts/blender_mcp_doctor.sh --fix
 - If MCP starts misbehaving mid-session, run the fix command **first** before reporting "connection failed" to the user.
 - 长任务拆分多次小调用，每次 ≤ 30s。
 
+## Baking via MCP: Standard SOP
+
+When the user asks to bake textures (albedo, normal, etc.), **always use `Scripts/bake.py`** — never hand-write inline bake code.
+
+### MCP Socket Protocol
+
+CodeBuddy 的 MCP 工具（`mcp_call_tool`）走的是 FastMCP stdio 协议。如果需要直接测试 Blender 连接，可通过 socket 直接与 Blender addon 的 9876 端口通信：
+
+```python
+import socket, json
+
+def mcp_call(cmd_type, params=None):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(300)  # 烘焙需要长超时
+    s.connect(('127.0.0.1', 9876))
+    req = json.dumps({'type': cmd_type, 'params': params or {}}) + '\n'
+    s.sendall(req.encode())
+    data = b''
+    while True:
+        chunk = s.recv(65536)
+        if not chunk: break
+        data += chunk
+        try:
+            json.loads(data.decode().strip())
+            break
+        except:
+            pass
+    s.close()
+    return json.loads(data.decode().strip())
+```
+
+**注意**：addon 端的命令类型名与 MCP tool 名不同：
+
+| MCP tool 名 | addon 命令类型 | params |
+|-------------|--------------|--------|
+| `get_scene_info` | `get_scene_info` | `{}` |
+| `get_object_info` | `get_object_info` | `{"name": "obj_name"}` |
+| `execute_blender_code` | `execute_code` | `{"code": "..."}` |
+| `get_viewport_screenshot` | `get_viewport_screenshot` | `{}` |
+
+### 调用 bake.py 的标准方式
+
+```python
+# 通过 execute_code 在 Blender 内部执行
+code = '''
+import sys
+sys.path.insert(0, '/Users/zbb/3DPipeLine/Scripts')
+from bake import bake_high_to_low
+alb, norm = bake_high_to_low(
+    high_fbx="/path/to/high.fbx",
+    low_obj="/path/to/low.obj",
+    out_dir="/path/to/output",
+    name="MyModel",
+)
+print(f"Albedo: {alb}")
+print(f"Normal: {norm}")
+'''
+result = mcp_call('execute_code', {'code': code})
+```
+
+### 限制与注意事项
+
+1. **避免在 JSON 中传递二进制字符串**：如果 bake 代码中包含 `\x00` 等字节，会导致 `exec()` 失败。解决方案：将脚本写入 `.py` 文件，然后用 `exec(open("path/to/script.py").read())` 执行。
+2. **长超时**：`bake_high_to_low()` 包含两次 `bpy.ops.object.bake()`，socket 超时需设为 300s。
+3. **一次一个 bake 调用**：不要在一个 `execute_code` 中串行调用多个 `bake_high_to_low()`。
+4. **PIL 不可用**：Blender 内嵌 Python 无 PIL，验证图像时需用自定义 PNG reader 或直接读 `img.pixels`。
+
+---
+
 ## Recommended Response Pattern
 
 When the user says "connect Blender" or similar:
@@ -208,3 +277,5 @@ When the user says "connect Blender" or similar:
 3. On failure, in one short message: report the specific error and the three checks listed above.
 
 Do not produce step-by-step "I am now checking..." narration. Keep replies tight.
+
+When the user asks to bake textures: use `bake.py` via `execute_code`, never hand-write bake logic inline.
