@@ -6,6 +6,9 @@ Scripts/__pycache__/
 # Output directory (baked textures, FBX, renders, etc.)
 outPut/
 
+# Bake preview/renders at root
+bake_*.png
+
 # macOS
 .DS_Store
 

@@ -7,7 +7,7 @@
     自动重试：Decimate 无法精确控制面数 → 自动用二分法调整 ratio 直到误差<10%
   模式 B（兼容）：外部减面 — 导入高模 FBX + 低模 OBJ → 对齐 → 修复法线 → 烘焙
 
-输出：烘焙结果（低模+材质）直接留在 Blender 场景中，不输出 PNG 文件
+输出：烘焙结果（高模+低模+材质）直接留在 Blender 场景中，不输出 PNG 文件
 
 用法：
     from bake import bake_high_to_low
@@ -495,8 +495,61 @@ def _bake_normal(obj_high, obj_low, img_normal, nt, n_norm):
     print("    BAKE DONE: Normal")
 
 
+def purge_bake_residue(verbose: bool = True):
+    """彻底清除场景中所有"潜在污染源"，让场景回到可以干净导入新模型的状态。
+
+    重点解决以下污染：
+    - 隐藏的高低模对象（hide_viewport=True 时 select_all 漏选）
+    - 它们引用的原始 PBR 纹理（被引用 → 后续导入同名贴图变 .001）
+    - 烘焙残留的 bake_*_albedo / bake_*_normal 图像
+    - 所有孤立 mesh/material/image/texture
+
+    调用场景：
+    - 烘焙完成后、即将导入新模型前
+    - 任何 `import_scene.fbx` 之前
+    """
+    import bpy
+
+    # 1. 强制删除所有 MESH 对象（包括 hidden）
+    n_objs = 0
+    for obj in list(bpy.data.objects):
+        if obj.type == "MESH":
+            bpy.data.objects.remove(obj, do_unlink=True)
+            n_objs += 1
+    if verbose:
+        print(f"    Purged {n_objs} mesh objects (including hidden)")
+
+    # 2. 多轮孤立清理（删 obj 后释放 mesh/material → 释放 image → 释放 texture）
+    total_removed = 0
+    for _r in range(5):
+        removed = 0
+        for bt in (bpy.data.meshes, bpy.data.materials, bpy.data.images, bpy.data.textures):
+            for block in list(bt):
+                # 跳过 fake_user 和系统块
+                if block.users == 0 and not block.use_fake_user:
+                    bt.remove(block)
+                    removed += 1
+        if removed == 0:
+            break
+        total_removed += removed
+        if verbose:
+            print(f"    Cleanup round {_r+1}: removed {removed} blocks")
+
+    # 3. 残留检查
+    leftover = {
+        "objects": len([o for o in bpy.data.objects if o.type == "MESH"]),
+        "meshes": len(bpy.data.meshes),
+        "materials": len(bpy.data.materials),
+        "images": len([i for i in bpy.data.images if i.name not in ("Render Result", "Viewer Node")]),
+    }
+    if verbose:
+        print(f"    Purge done. Remaining: {leftover}")
+    return leftover
+
+
 def bake_high_to_low(
-    high_fbx: str,
+    high_fbx: str = None,
+    high_obj_name: str = None,
     low_obj: str = None,
     name: str = "bake",
     cage: float = DEFAULT_CAGE,
@@ -511,15 +564,24 @@ def bake_high_to_low(
     max_ray_dist: float = 0.0,
 ):
     """
-    统一烘焙入口：高模 → 低模 → 烘焙 Albedo+Normal → 结果留在 Blender 场景中。
+    统一烘焙入口：高模 → 低模 → 烘焙 Albedo+Normal → 高模和低模都留在 Blender 场景中。
 
     模式 A（推荐）：不提供 low_obj → Blender 内自动减面（带二分法重试）
     模式 B（兼容）：提供 low_obj → 导入外部低模 + 对齐
 
-    烘焙完成后：低模（带烘焙材质）留在场景中，高模被删除，不输出 PNG 文件。
+    高模来源（二选一）：
+    - high_obj_name: 使用场景中已有的对象（优先）
+    - high_fbx: 从文件导入（high_obj_name 为 None 时使用）
+
+    烘焙完成后：
+    - 高模和低模都保留在场景中
+    - 低模带烘焙材质 bake_<name>（Albedo + Normal）
+    - 高模保留原始 PBR 材质和纹理
+    - 清理孤立数据块（无引用的 mesh/material/image/texture）
 
     参数:
         high_fbx: 带纹理的高模路径（FBX 或 OBJ）
+        high_obj_name: 场景中已有的高模对象名（优先于 high_fbx）
         low_obj: 低模 OBJ 路径（None=Blender 内自动减面）
         name: 烘焙贴图名称前缀
         cage: cage extrusion 距离（默认 0.1）
@@ -536,10 +598,14 @@ def bake_high_to_low(
     import bpy
     import mathutils
 
+    if high_obj_name is None and high_fbx is None:
+        raise RuntimeError("必须提供 high_obj_name 或 high_fbx 之一")
+
     mode = "A (Blender内减面)" if low_obj is None else "B (外部OBJ低模)"
+    high_src = high_obj_name if high_obj_name else high_fbx
     print(f"\n{'='*70}")
     print(f"BAKE: {name}  [模式 {mode}]")
-    print(f"  High:   {high_fbx}")
+    print(f"  High:   {high_src} {'(场景对象)' if high_obj_name else '(文件导入)'}")
     if low_obj:
         print(f"  Low:    {low_obj}")
     else:
@@ -564,34 +630,44 @@ def bake_high_to_low(
             bpy.data.meshes.remove(mesh)
     print("    Pre-cleanup done")
 
-    # === 1. 导入高模（带纹理） ===
-    print("[1] Importing high-poly model...")
-    bpy.ops.object.select_all(action="DESELECT")
-    existing = set(bpy.data.objects.keys())
-
-    ext = Path(high_fbx).suffix.lower()
-    if ext == ".obj":
-        bpy.ops.wm.obj_import(filepath=high_fbx)
-    elif ext in (".fbx",):
-        bpy.ops.import_scene.fbx(filepath=high_fbx)
+    # === 1. 获取高模 ===
+    if high_obj_name:
+        # 使用场景中已有的对象
+        print(f"[1] Using existing scene object '{high_obj_name}' as high-poly...")
+        obj_high = bpy.data.objects.get(high_obj_name)
+        if obj_high is None:
+            raise RuntimeError(f"场景中未找到对象 '{high_obj_name}'")
+        if obj_high.type != "MESH":
+            raise RuntimeError(f"对象 '{high_obj_name}' 不是 MESH 类型（{obj_high.type}）")
     else:
-        raise RuntimeError(f"不支持的格式: {ext}（仅支持 .fbx / .obj）")
-
-    new_objs = [o for o in bpy.data.objects if o.name not in existing]
-    meshes = [o for o in new_objs if o.type == "MESH"]
-    if not meshes:
-        raise RuntimeError(f"文件中无 MESH 对象: {high_fbx}")
-
-    if len(meshes) > 1:
+        # 从文件导入
+        print("[1] Importing high-poly model...")
         bpy.ops.object.select_all(action="DESELECT")
-        for m in meshes:
-            m.select_set(True)
-        bpy.context.view_layer.objects.active = meshes[0]
-        bpy.ops.object.join()
+        existing = set(bpy.data.objects.keys())
 
-    obj_high = [o for o in bpy.data.objects if o.type == "MESH" and o.select_get()][0] if len(meshes) > 1 else meshes[0]
+        ext = Path(high_fbx).suffix.lower()
+        if ext == ".obj":
+            bpy.ops.wm.obj_import(filepath=high_fbx)
+        elif ext in (".fbx",):
+            bpy.ops.import_scene.fbx(filepath=high_fbx)
+        else:
+            raise RuntimeError(f"不支持的格式: {ext}（仅支持 .fbx / .obj）")
+
+        new_objs = [o for o in bpy.data.objects if o.name not in existing]
+        meshes = [o for o in new_objs if o.type == "MESH"]
+        if not meshes:
+            raise RuntimeError(f"文件中无 MESH 对象: {high_fbx}")
+
+        if len(meshes) > 1:
+            bpy.ops.object.select_all(action="DESELECT")
+            for m in meshes:
+                m.select_set(True)
+            bpy.context.view_layer.objects.active = meshes[0]
+            bpy.ops.object.join()
+
+        obj_high = [o for o in bpy.data.objects if o.type == "MESH" and o.select_get()][0] if len(meshes) > 1 else meshes[0]
+
     obj_high.name = f"{name}_High"
-
     bpy.ops.object.select_all(action="DESELECT")
     obj_high.select_set(True)
     bpy.context.view_layer.objects.active = obj_high
@@ -744,27 +820,81 @@ def bake_high_to_low(
     except Exception as e:
         print(f"    Pack warning (non-critical): {e}")
 
-    # === 11. 清理：删除高模，保留低模 ===
-    print("[11] Cleaning up high-poly, keeping low-poly in scene...")
-    high_name = obj_high.name
-    bpy.ops.object.select_all(action="DESELECT")
-    obj_high.select_set(True)
-    bpy.ops.object.delete(use_global=False)
+    # === 11. 收尾：保留高模和低模 + 隔离高模资源避免污染下次导入 ===
+    print("[11] Keeping both models + isolating high-poly resources to prevent pollution...")
 
-    # 清理孤立数据（mesh, material, image 无引用的）
-    for block_type in (bpy.data.meshes, bpy.data.materials):
-        for block in block_type:
-            if block.users == 0:
-                block_type.remove(block)
+    # 关键修复：给高模引用的所有原始资源（图像/材质/纹理/mesh）加上唯一前缀，
+    # 让它们脱离与磁盘文件名/原名的关联。这样下次导入同名 FBX 时，Blender 不会
+    # 在内存中找到同名 image 而错误复用，会从磁盘正常加载新纹理。
+    iso_prefix = f"__baked_{name}__"
 
-    # 确认低模还在
+    # 1) 重命名高模引用的所有 image（Blender 凭 image.name 决定 FBX 导入是否复用）
+    high_images = set()
+    high_materials = set()
+    for slot in obj_high.material_slots:
+        m = slot.material
+        if m is None:
+            continue
+        high_materials.add(m)
+        if m.use_nodes:
+            for node in m.node_tree.nodes:
+                if node.type == "TEX_IMAGE" and node.image:
+                    high_images.add(node.image)
+
+    n_imgs = 0
+    for img in high_images:
+        if img.name.startswith(iso_prefix):
+            continue
+        # 同时清空 filepath，进一步防止"按文件路径匹配"的复用逻辑
+        img.filepath = ""
+        img.filepath_raw = ""
+        img.name = iso_prefix + img.name
+        n_imgs += 1
+    print(f"    Renamed {n_imgs} high-poly textures with prefix '{iso_prefix}'")
+
+    # 2) 重命名高模材质（避免下次导入的 'Material' 撞上现有同名材质，产生 .001）
+    n_mats = 0
+    for m in high_materials:
+        if m.name.startswith(iso_prefix):
+            continue
+        m.name = iso_prefix + m.name
+        n_mats += 1
+    print(f"    Renamed {n_mats} high-poly materials")
+
+    # 3) 重命名高模 mesh data（防止 mesh 数据块名冲突）
+    if obj_high.data and not obj_high.data.name.startswith(iso_prefix):
+        obj_high.data.name = iso_prefix + obj_high.data.name
+
+    # 4) 多轮孤立清理（删 obj 后释放 mesh/material，删 material 后释放 image，链式清理）
+    for _round in range(5):
+        removed = 0
+        for block_type in (bpy.data.meshes, bpy.data.materials, bpy.data.images, bpy.data.textures):
+            for block in list(block_type):
+                if block.users == 0 and not block.use_fake_user:
+                    block_type.remove(block)
+                    removed += 1
+        if removed == 0:
+            break
+        print(f"    Cleanup round {_round + 1}: removed {removed} orphan blocks")
+
+    # 验证最终场景状态
     obj_low_ref = bpy.data.objects.get(obj_low.name)
+    obj_high_ref = bpy.data.objects.get(obj_high.name)
+    leftover_imgs = [i.name for i in bpy.data.images if i.name not in ("Render Result", "Viewer Node")]
+
     if obj_low_ref:
         print(f"\n[DONE] {name}: 低模 '{obj_low.name}' 已留在场景中")
         print(f"    面数: {actual_faces} (目标 {target_faces})")
         print(f"    材质: bake_{name} (Albedo + Normal)")
     else:
         print(f"\n[WARN] 低模 '{obj_low.name}' 未找到！")
+
+    if obj_high_ref:
+        print(f"    高模 '{obj_high.name}' 已保留在场景中")
+    else:
+        print(f"    [WARN] 高模 '{obj_high.name}' 未找到！")
+
+    print(f"    最终场景图像: {leftover_imgs}")
 
     return obj_low.name, actual_faces
 
@@ -778,7 +908,8 @@ def main():
 
     import argparse
     p = argparse.ArgumentParser(description="统一烘焙脚本（结果留在 Blender 场景中）")
-    p.add_argument("--high_fbx", required=True, help="带纹理的高模路径（FBX 或 OBJ）")
+    p.add_argument("--high_fbx", default=None, help="带纹理的高模路径（FBX 或 OBJ）")
+    p.add_argument("--high_obj_name", default=None, help="场景中已有的高模对象名（优先于 --high_fbx）")
     p.add_argument("--low_obj", default=None, help="低模 OBJ 路径（不提供则 Blender 内自动减面）")
     p.add_argument("--name", default="bake", help="贴图名称前缀")
     p.add_argument("--cage", type=float, default=DEFAULT_CAGE,
@@ -800,6 +931,7 @@ def main():
 
     bake_high_to_low(
         high_fbx=args.high_fbx,
+        high_obj_name=args.high_obj_name,
         low_obj=args.low_obj,
         name=args.name,
         cage=args.cage,
