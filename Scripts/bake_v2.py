@@ -496,7 +496,8 @@ def _bake_normal(obj_high, obj_low, img_normal, nt, n_norm):
 
 
 def bake_high_to_low(
-    high_fbx: str,
+    high_fbx: str = None,
+    high_obj_name: str = None,
     low_obj: str = None,
     name: str = "bake",
     cage: float = DEFAULT_CAGE,
@@ -513,13 +514,19 @@ def bake_high_to_low(
     """
     统一烘焙入口：高模 → 低模 → 烘焙 Albedo+Normal → 结果留在 Blender 场景中。
 
-    模式 A（推荐）：不提供 low_obj → Blender 内自动减面（带二分法重试）
-    模式 B（兼容）：提供 low_obj → 导入外部低模 + 对齐
+    高模来源（二选一）：
+      - high_obj_name: 直接使用场景中已有的对象（推荐，避免 FBX 往返丢失纹理）
+      - high_fbx: 从文件导入（FBX/OBJ），纹理可能因导出/导入而丢失
+
+    低模来源：
+      模式 A（推荐）：不提供 low_obj → Blender 内自动减面（带二分法重试）
+      模式 B（兼容）：提供 low_obj → 导入外部低模 + 对齐
 
     烘焙完成后：低模（带烘焙材质）留在场景中，高模被删除，不输出 PNG 文件。
 
     参数:
         high_fbx: 带纹理的高模路径（FBX 或 OBJ）
+        high_obj_name: 场景中已有的高模对象名（优先于 high_fbx）
         low_obj: 低模 OBJ 路径（None=Blender 内自动减面）
         name: 烘焙贴图名称前缀
         cage: cage extrusion 距离（默认 0.1）
@@ -536,10 +543,15 @@ def bake_high_to_low(
     import bpy
     import mathutils
 
+    if high_obj_name is None and high_fbx is None:
+        raise RuntimeError("必须提供 high_obj_name 或 high_fbx 之一")
+
+    use_in_scene = high_obj_name is not None
     mode = "A (Blender内减面)" if low_obj is None else "B (外部OBJ低模)"
+    high_src = high_obj_name if use_in_scene else high_fbx
     print(f"\n{'='*70}")
     print(f"BAKE: {name}  [模式 {mode}]")
-    print(f"  High:   {high_fbx}")
+    print(f"  High:   {'[in-scene] ' + high_obj_name if use_in_scene else high_fbx}")
     if low_obj:
         print(f"  Low:    {low_obj}")
     else:
@@ -564,39 +576,83 @@ def bake_high_to_low(
             bpy.data.meshes.remove(mesh)
     print("    Pre-cleanup done")
 
-    # === 1. 导入高模（带纹理） ===
-    print("[1] Importing high-poly model...")
-    bpy.ops.object.select_all(action="DESELECT")
-    existing = set(bpy.data.objects.keys())
+    # === 1. 获取高模 ===
+    if use_in_scene:
+        # 直接使用场景中的对象（避免 FBX 往返丢失纹理）
+        print(f"[1] Using in-scene object '{high_obj_name}' as high-poly...")
+        obj_high = bpy.data.objects.get(high_obj_name)
+        if obj_high is None or obj_high.type != "MESH":
+            raise RuntimeError(f"场景中未找到 MESH 对象: '{high_obj_name}'")
+        # 复制一份作为烘焙用高模（原始对象不受影响）
+        # 关键：必须深拷贝材质！否则 EMIT 烘焙修改材质节点时会影响原始高模，
+        # 导致烘焙后原始高模材质被破坏（显示为灰色）
+        obj_high_copy = obj_high.copy()
+        obj_high_copy.data = obj_high.data.copy()
+        obj_high_copy.name = f"{name}_High"
+        # 深拷贝材质：为复制的 mesh 创建独立的材质副本
+        for i, slot in enumerate(obj_high_copy.material_slots):
+            if slot.material:
+                mat_orig = slot.material
+                mat_copy = mat_orig.copy()
+                mat_copy.name = f"{name}_High_{mat_orig.name}"
+                slot.material = mat_copy
+        bpy.context.collection.objects.link(obj_high_copy)
+        obj_high = obj_high_copy
 
-    ext = Path(high_fbx).suffix.lower()
-    if ext == ".obj":
-        bpy.ops.wm.obj_import(filepath=high_fbx)
-    elif ext in (".fbx",):
-        bpy.ops.import_scene.fbx(filepath=high_fbx)
-    else:
-        raise RuntimeError(f"不支持的格式: {ext}（仅支持 .fbx / .obj）")
-
-    new_objs = [o for o in bpy.data.objects if o.name not in existing]
-    meshes = [o for o in new_objs if o.type == "MESH"]
-    if not meshes:
-        raise RuntimeError(f"文件中无 MESH 对象: {high_fbx}")
-
-    if len(meshes) > 1:
         bpy.ops.object.select_all(action="DESELECT")
-        for m in meshes:
-            m.select_set(True)
-        bpy.context.view_layer.objects.active = meshes[0]
-        bpy.ops.object.join()
+        obj_high.select_set(True)
+        bpy.context.view_layer.objects.active = obj_high
+        bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+        print(f"    High: verts={len(obj_high.data.vertices)}, faces={len(obj_high.data.polygons)}")
 
-    obj_high = [o for o in bpy.data.objects if o.type == "MESH" and o.select_get()][0] if len(meshes) > 1 else meshes[0]
-    obj_high.name = f"{name}_High"
+        # 诊断：打印高模材质信息
+        for i, slot in enumerate(obj_high.material_slots):
+            m = slot.material
+            if m and m.use_nodes:
+                bsdf = next((n for n in m.node_tree.nodes if n.type == "BSDF_PRINCIPLED"), None)
+                if bsdf:
+                    bc = bsdf.inputs["Base Color"]
+                    if bc.is_linked:
+                        src = bc.links[0].from_node
+                        print(f"    材质[{i}] '{m.name}': Base Color ← {src.name} ({src.type})")
+                    else:
+                        print(f"    材质[{i}] '{m.name}': Base Color = {tuple(bc.default_value)[:3]}")
+            elif m:
+                print(f"    材质[{i}] '{m.name}': diffuse_color={tuple(m.diffuse_color)[:3]}, use_nodes={m.use_nodes}")
+    else:
+        # 从文件导入
+        print("[1] Importing high-poly model...")
+        bpy.ops.object.select_all(action="DESELECT")
+        existing = set(bpy.data.objects.keys())
 
-    bpy.ops.object.select_all(action="DESELECT")
-    obj_high.select_set(True)
-    bpy.context.view_layer.objects.active = obj_high
-    bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
-    print(f"    High: verts={len(obj_high.data.vertices)}, faces={len(obj_high.data.polygons)}")
+        ext = Path(high_fbx).suffix.lower()
+        if ext == ".obj":
+            bpy.ops.wm.obj_import(filepath=high_fbx)
+        elif ext in (".fbx",):
+            bpy.ops.import_scene.fbx(filepath=high_fbx)
+        else:
+            raise RuntimeError(f"不支持的格式: {ext}（仅支持 .fbx / .obj）")
+
+        new_objs = [o for o in bpy.data.objects if o.name not in existing]
+        meshes = [o for o in new_objs if o.type == "MESH"]
+        if not meshes:
+            raise RuntimeError(f"文件中无 MESH 对象: {high_fbx}")
+
+        if len(meshes) > 1:
+            bpy.ops.object.select_all(action="DESELECT")
+            for m in meshes:
+                m.select_set(True)
+            bpy.context.view_layer.objects.active = meshes[0]
+            bpy.ops.object.join()
+
+        obj_high = [o for o in bpy.data.objects if o.type == "MESH" and o.select_get()][0] if len(meshes) > 1 else meshes[0]
+        obj_high.name = f"{name}_High"
+
+        bpy.ops.object.select_all(action="DESELECT")
+        obj_high.select_set(True)
+        bpy.context.view_layer.objects.active = obj_high
+        bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+        print(f"    High: verts={len(obj_high.data.vertices)}, faces={len(obj_high.data.polygons)}")
 
     # === 1b. 材质校验 ===
     ok, msg = _validate_high_material(obj_high)
@@ -673,40 +729,30 @@ def bake_high_to_low(
         f"bake_{name}_normal", "Non-Color", (0.5, 0.5, 1, 1), True, res
     )
 
-    # === 6. 低模材质 + 节点树 ===
-    print("[6] Setting up low-poly material...")
+    # === 6. 低模材质（烘焙前：仅包含 TexImage 节点，不引用烘焙图，避免循环依赖）===
+    # 关键：如果 TexImage 引用了 img_albedo/img_normal，烘焙时 Blender 检测到
+    # "写入图像 ← 材质读取图像" 的循环依赖，导致烘焙结果为默认紫色。
+    # 解决：烘焙前用占位节点（不赋图），烘焙后再组装完整材质。
+    print("[6] Setting up low-poly material (bake-only, no image refs)...")
     mat = bpy.data.materials.new(f"bake_{name}")
     mat.use_nodes = True
     nt = mat.node_tree
     for n in list(nt.nodes):
         nt.nodes.remove(n)
 
-    tex_coord = nt.nodes.new("ShaderNodeTexCoord")
-    mapping = nt.nodes.new("ShaderNodeMapping")
-    nt.links.new(tex_coord.outputs["UV"], mapping.inputs["Vector"])
-
+    # 烘焙时只需要 TexImage 节点作为烘焙目标，不需要连接到 BSDF
     n_alb = nt.nodes.new("ShaderNodeTexImage")
-    n_alb.image = img_albedo
-    n_alb.label = "albedo"
+    n_alb.label = "albedo_bake_target"
+    n_alb.image = img_albedo  # 烘焙目标图（但节点不连入着色器网络）
 
     n_norm = nt.nodes.new("ShaderNodeTexImage")
+    n_norm.label = "normal_bake_target"
     n_norm.image = img_normal
-    n_norm.label = "normal"
 
-    for n in (n_alb, n_norm):
-        nt.links.new(mapping.outputs["Vector"], n.inputs["Vector"])
-
-    n_normmap = nt.nodes.new("ShaderNodeNormalMap")
-    n_normmap.space = "TANGENT"
-    nt.links.new(n_norm.outputs["Color"], n_normmap.inputs["Color"])
-
-    bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled")
-    bsdf.inputs["Metallic"].default_value = 0.0
-    bsdf.inputs["Roughness"].default_value = 0.8
-    out_node = nt.nodes.new("ShaderNodeOutputMaterial")
-    nt.links.new(n_alb.outputs["Color"], bsdf.inputs["Base Color"])
-    nt.links.new(n_normmap.outputs["Normal"], bsdf.inputs["Normal"])
-    nt.links.new(bsdf.outputs["BSDF"], out_node.inputs["Surface"])
+    # 占位 BSDF + Output（让材质合法）
+    bsdf_tmp = nt.nodes.new("ShaderNodeBsdfPrincipled")
+    out_tmp = nt.nodes.new("ShaderNodeOutputMaterial")
+    nt.links.new(bsdf_tmp.outputs["BSDF"], out_tmp.inputs["Surface"])
 
     obj_low.data.materials.clear()
     obj_low.data.materials.append(mat)
@@ -736,26 +782,62 @@ def bake_high_to_low(
     print("[9] Baking Normal...")
     _bake_normal(obj_high, obj_low, img_normal, nt, n_norm)
 
-    # === 10. 打包烘焙图（确保 .blend 保存时图像数据不丢失）===
-    print("[10] Packing bake images into .blend...")
+    # === 10. 烘焙完成，组装完整材质（此时赋图不会循环依赖）===
+    print("[10] Assembling final material with baked textures...")
+    for n in list(nt.nodes):
+        nt.nodes.remove(n)
+
+    tex_coord = nt.nodes.new("ShaderNodeTexCoord")
+    mapping = nt.nodes.new("ShaderNodeMapping")
+    nt.links.new(tex_coord.outputs["UV"], mapping.inputs["Vector"])
+
+    n_alb_final = nt.nodes.new("ShaderNodeTexImage")
+    n_alb_final.image = img_albedo
+    n_alb_final.label = "albedo"
+
+    n_norm_final = nt.nodes.new("ShaderNodeTexImage")
+    n_norm_final.image = img_normal
+    n_norm_final.label = "normal"
+
+    for n in (n_alb_final, n_norm_final):
+        nt.links.new(mapping.outputs["Vector"], n.inputs["Vector"])
+
+    n_normmap = nt.nodes.new("ShaderNodeNormalMap")
+    n_normmap.space = "TANGENT"
+    nt.links.new(n_norm_final.outputs["Color"], n_normmap.inputs["Color"])
+
+    bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled")
+    bsdf.inputs["Metallic"].default_value = 0.0
+    bsdf.inputs["Roughness"].default_value = 0.8
+    out_node = nt.nodes.new("ShaderNodeOutputMaterial")
+    nt.links.new(n_alb_final.outputs["Color"], bsdf.inputs["Base Color"])
+    nt.links.new(n_normmap.outputs["Normal"], bsdf.inputs["Normal"])
+    nt.links.new(bsdf.outputs["BSDF"], out_node.inputs["Surface"])
+
+    # === 10b. 打包烘焙图（确保 .blend 保存时图像数据不丢失）===
+    print("[10b] Packing bake images into .blend...")
     try:
         img_albedo.pack()
         img_normal.pack()
     except Exception as e:
         print(f"    Pack warning (non-critical): {e}")
 
-    # === 11. 清理：删除高模，保留低模 ===
-    print("[11] Cleaning up high-poly, keeping low-poly in scene...")
+    # === 11. 清理：隐藏烘焙用高模，保留低模和原始高模 ===
+    # 不删除高模：用户可能需要继续查看/对比高模
+    # 对于 in-scene 模式：obj_high 是副本，原始高模不受影响，只需隐藏副本
+    # 对于 import 模式：obj_high 是导入的高模，隐藏而非删除，方便用户对比
+    # 重要：只使用 hide_viewport（对应 outliner 眼睛图标），绝不用 hide_set()
+    # hide_set() 会设置临时覆盖状态，导致用户无法在 outliner 中自由切换显示
+    print("[11] Hiding high-poly bake copy, keeping low-poly in scene...")
+    obj_high.hide_viewport = True
     high_name = obj_high.name
-    bpy.ops.object.select_all(action="DESELECT")
-    obj_high.select_set(True)
-    bpy.ops.object.delete(use_global=False)
 
-    # 清理孤立数据（mesh, material, image 无引用的）
-    for block_type in (bpy.data.meshes, bpy.data.materials):
+    # 清理孤立数据（仅清理真正无引用的）
+    for block_type in (bpy.data.meshes,):
         for block in block_type:
             if block.users == 0:
                 block_type.remove(block)
+    # 注意：不清理 materials，因为原始高模的材质仍在使用
 
     # 确认低模还在
     obj_low_ref = bpy.data.objects.get(obj_low.name)
