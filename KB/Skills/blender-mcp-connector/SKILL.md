@@ -12,17 +12,106 @@
 
 ---
 
+## 三脚本流水线 — 强制要求
+
+**导入、烘焙、导出操作必须且只能使用以下三个脚本，禁止手写内联代码或使用其他方式。**
+
+### 1. 导入 — `Scripts/import_fbx.py`
+
+**用途**：安全导入 FBX（防贴图污染）或 OBJ（纯几何）到 Blender 场景。
+
+```python
+import sys; sys.path.insert(0, '/Users/zbb/3DPipeLine/Scripts')
+from import_fbx import safe_import, batch_import_and_run, batch_import_and_bake
+
+# 单文件导入
+new_objs = safe_import("/path/to/model.fbx")   # 自动防污染 + 按文件名重命名
+new_objs = safe_import("/path/to/model.obj")    # OBJ 导入（无需防污染）
+
+# 批量导入并烘焙
+batch_import_and_bake(
+    file_paths=["/path/a.fbx", "/path/b.fbx"],
+    name_pattern="Building{idx_1based}",
+    target_faces=3000, cage=0.1, res=4096, samples=64, device="GPU",
+)
+```
+
+**防污染原理**：FBX 导入前自动隔离所有已有 image（加 `__guard_` 前缀 + 清空 filepath），切断 Blender 按名复用内存图像的路径。
+
+**禁止**：
+- ~~直接调用 `bpy.ops.import_scene.fbx()`~~ （无防污染保护）
+- ~~手写隔离逻辑~~ （必须用 `safe_import()` 或 `isolate_existing_images()`）
+
+### 2. 烘焙 — `Scripts/bake.py`
+
+**用途**：高模 → Blender 内减面 → 烘焙 Albedo(EMIT) + Normal → 高低模都留场景。
+
+```python
+from bake import bake_high_to_low, purge_bake_residue
+
+# 模式 A（推荐）：Blender 内 Decimate 减面 + 烘焙
+bake_high_to_low(high_obj_name="building1", name="Building1",
+                 target_faces=3000, cage=0.1, res=4096, samples=64, device="GPU")
+
+# 模式 B：外部 OBJ 低模 + 对齐 + 烘焙
+bake_high_to_low(high_obj_name="building1", low_obj="/path/low.obj", name="Building1")
+
+# 清场
+purge_bake_residue()
+```
+
+**核心规则**：
+- Albedo 必须用 EMIT 烘焙（禁用 DIFFUSE）
+- cage=0.1, res=4096, samples=64, Cycles+GPU
+- Smart UV island_margin=0.01
+- 烘焙后高模资源自动加 `__baked_` 前缀隔离
+
+**禁止**：
+- ~~手写内联烘焙代码~~ （必须通过 `bake_high_to_low()` 执行）
+- ~~使用 DIFFUSE 烘焙 Albedo~~ （必须用 EMIT）
+- ~~直接修改 bake.py~~ （先复制为 bake_v2.py 测试，确认后再合并）
+
+### 3. 导出 — `Scripts/export_model.py`
+
+**用途**：将场景中指定对象导出为 FBX（内嵌纹理）或 OBJ（纯几何）。
+
+```python
+from export_model import export_model, export_all_meshes
+
+# 导出为 FBX（内嵌纹理）
+export_model(obj_names=["Building1_Low"], output_path="/tmp/building1.fbx", fmt="fbx")
+
+# 导出为 OBJ（纯几何）
+export_model(obj_names=["Building1_Low"], output_path="/tmp/building1.obj", fmt="obj")
+
+# 自动判断格式
+export_model(obj_names=["Building1_Low"], output_path="/tmp/building1", fmt="auto")
+
+# 批量导出场景中所有 mesh
+export_all_meshes(output_dir="/tmp/output", fmt="auto")
+```
+
+**禁止**：
+- ~~直接调用 `bpy.ops.export_scene.fbx()`~~ （不保证内嵌纹理正确）
+- ~~直接调用 `bpy.ops.wm.obj_export()`~~ （不保证参数一致）
+
+---
+
 ## CLI 用法
 
 ```bash
-# 标准连接（自动修复 + 详细输出）
+# 连接 Blender
 python3 /Users/zbb/3DPipeLine/Scripts/blender_connect.py --fix --verbose
 
-# 只诊断不连接
-python3 /Users/zbb/3DPipeLine/Scripts/blender_connect.py --diag-only
-
-# 连接并在 Blender 内执行代码
-python3 /Users/zbb/3DPipeLine/Scripts/blender_connect.py --exec "import bpy; print(len(bpy.data.objects))"
+# 在 Blender 中执行脚本
+python3 -c "
+from blender_connect import send_python
+send_python('''
+import sys; sys.path.insert(0, \"/Users/zbb/3DPipeLine/Scripts\")
+from import_fbx import safe_import
+safe_import(\"/path/to/model.fbx\")
+''')
+"
 ```
 
 退出码：0=OK, 1=Blender未启动, 2=9876未监听/被占用, 3=wrapper污染, 4=addon异常, 5=其他
@@ -37,31 +126,16 @@ sys.path.insert(0, '/Users/zbb/3DPipeLine/Scripts')
 from blender_connect import ensure_blender, send_python, BlenderConnectError
 
 try:
-    ensure_blender()  # 保证连接可用，否则抛 BlenderConnectError（含完整诊断）
+    ensure_blender()
     r = send_python("import bpy; bpy.ops.mesh.primitive_cube_add()")
 except BlenderConnectError as e:
     print(f"连接失败 (exit={e.exit_code}):", e)
-    print("诊断快照:", e.diagnostics)
 ```
 
 长任务（烘焙等）需增大超时：
 ```python
 send_python("bpy.ops.object.bake()", recv_timeout=300)
 ```
-
----
-
-## 脚本工作原理
-
-1. **直接 TCP 连接 Blender 内 addon 监听的 9876 端口** —— 绕过 MCP wrapper，最稳定（不受 wrapper 污染影响）
-2. **完整诊断**（每次失败都输出）：
-   - Blender 进程数
-   - 9876 端口监听状态 + listener 是否是 Blender（防止端口被其他进程占用）
-   - wrapper 进程数（健康 ≤3 / 污染 ≥4）
-   - ESTABLISHED 连接数
-3. **自动恢复**：wrapper 污染时自动调用 `blender_mcp_doctor.sh --fix` 清理
-4. **3 次重试 + 指数退避**：偶发 socket 失败可自愈
-5. **macOS pgrep 兼容**：以 9876 端口 listener 是否为 Blender 为权威判断，不依赖 pgrep
 
 ---
 
@@ -78,6 +152,9 @@ send_python("bpy.ops.object.bake()", recv_timeout=300)
 
 | 文件 | 用途 |
 |---|---|
-| `/Users/zbb/3DPipeLine/Scripts/blender_connect.py` | 主连接脚本 |
+| `/Users/zbb/3DPipeLine/Scripts/blender_connect.py` | BlenderMCP 连接脚本 |
 | `/Users/zbb/3DPipeLine/Scripts/blender_mcp_doctor.sh` | wrapper 污染诊断+清理 |
-| `/Users/zbb/3DPipeLine/Scripts/bake.py` | 烘焙脚本（通过 blender_connect.py 调用） |
+| `/Users/zbb/3DPipeLine/Scripts/import_fbx.py` | 安全导入（FBX防污染 + OBJ） |
+| `/Users/zbb/3DPipeLine/Scripts/bake.py` | 烘焙脚本（EMIT法 + 资源隔离） |
+| `/Users/zbb/3DPipeLine/Scripts/export_model.py` | 导出脚本（FBX内嵌纹理 / OBJ纯几何） |
+| `/Users/zbb/3DPipeLine/Scripts/safe_fbx_import_addon.py` | Blender GUI 导入保护 addon |
