@@ -12,6 +12,13 @@
         fmt="fbx",
     )
 
+    # 导出为 FBX（内嵌纹理），自定义文件名
+    export_model(
+        obj_names=["building1_Low"],
+        output_path="/path/to/output.fbx",
+        output_name="my_building",
+        fmt="fbx",
+    )
     # 导出为 OBJ（纯几何，无纹理）
     export_model(
         obj_names=["building1_Low"],
@@ -96,12 +103,31 @@ def _resolve_format(fmt: str, objects) -> str:
     raise ValueError(f"不支持的导出格式: '{fmt}'（支持: fbx, obj, auto）")
 
 
-def _resolve_output_path(output_path: str, fmt: str) -> str:
-    """确保输出路径有正确的扩展名。"""
+def _resolve_output_path(output_path: str, fmt: str, output_name: str = "") -> str:
+    """确保输出路径有正确的扩展名。
+
+    Parameters
+    ----------
+    output_path : str
+        输出目录或完整文件路径。
+    fmt : str
+        导出格式 "fbx" 或 "obj"。
+    output_name : str
+        自定义文件名（不含扩展名）。提供后覆盖 output_path 中的文件名部分。
+        例：output_path="/tmp/out.fbx", output_name="my_model" → "/tmp/my_model.fbx"
+    """
     if not output_path:
         raise ValueError("output_path 不能为空")
 
     ext = ".fbx" if fmt == "fbx" else ".obj"
+
+    # 如果指定了 output_name，替换路径中的文件名
+    if output_name:
+        directory = os.path.dirname(os.path.abspath(output_path))
+        # 清理用户传入的扩展名（避免重复）
+        stem = os.path.splitext(output_name)[0] if os.path.splitext(output_name)[1].lower() in (".fbx", ".obj") else output_name
+        return os.path.join(directory, stem + ext)
+
     current_ext = os.path.splitext(output_path)[1].lower()
 
     if current_ext == ext:
@@ -166,7 +192,6 @@ def _export_fbx(objects, output_path, apply_transforms=True, verbose=True):
     kwargs = dict(
         filepath=output_path,
         use_selection=True,
-        apply_modifiers=True,
         # 内嵌纹理关键参数
         path_mode="COPY",        # 复制纹理文件到 FBX 旁边或内嵌
         embed_textures=True,     # 内嵌纹理到 FBX
@@ -227,6 +252,7 @@ def export_model(
     obj_names,
     output_path,
     fmt="auto",
+    output_name="",
     apply_transforms=True,
     verbose=True,
 ):
@@ -246,6 +272,9 @@ def export_model(
         - "fbx" — FBX，内嵌纹理（适合带贴图的烘焙低模）
         - "obj" — OBJ，纯几何无纹理（适合只需模型的场景）
         - "auto" — 自动判断：有纹理材质 → FBX，无纹理 → OBJ
+    output_name : str
+        自定义导出文件名（不含扩展名）。提供后覆盖 output_path 中的文件名部分，
+        目录仍取自 output_path。例：output_name="my_house" → my_house.fbx
     apply_transforms : bool
         导出前是否应用变换（location/rotation/scale → 0）。
         默认 True，确保导出坐标干净。
@@ -287,7 +316,7 @@ def export_model(
     resolved_fmt = _resolve_format(fmt, objects)
 
     # 解析输出路径
-    resolved_path = _resolve_output_path(output_path, resolved_fmt)
+    resolved_path = _resolve_output_path(output_path, resolved_fmt, output_name=output_name)
 
     print("=" * 70)
     print(f"EXPORT: {resolved_fmt.upper()}")
@@ -404,6 +433,7 @@ def main():
     p = argparse.ArgumentParser(description="模型导出脚本（FBX 内嵌纹理 / OBJ 纯几何）")
     p.add_argument("objects", nargs="+", help="要导出的对象名称")
     p.add_argument("-o", "--output", required=True, help="输出文件路径")
+    p.add_argument("-n", "--name", default="", help="自定义导出文件名（不含扩展名，覆盖路径中的文件名）")
     p.add_argument("-f", "--format", default="auto",
                    choices=["fbx", "obj", "auto"],
                    help="导出格式（默认 auto：有纹理→FBX，无纹理→OBJ）")
@@ -415,6 +445,7 @@ def main():
         obj_names=args.objects,
         output_path=args.output,
         fmt=args.format,
+        output_name=args.name,
         apply_transforms=not args.no_apply_transforms,
     )
 
