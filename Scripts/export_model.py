@@ -227,14 +227,12 @@ def _export_obj(objects, output_path, apply_transforms=True, verbose=True):
 
     kwargs = dict(
         filepath=output_path,
-        use_selection=True,
-        apply_modifiers=True,
         # 不导出材质
-        use_materials=False,
+        export_materials=False,
         # 不导出法线（避免兼容性问题，让导入端重新计算）
-        use_normals=False,
+        export_normals=False,
         # 导出 UV（保留展开信息，对后续烘焙有用）
-        use_uvs=True,
+        export_uv=True,
         # 坐标
         forward_axis="NEGATIVE_Z",
         up_axis="Y",
