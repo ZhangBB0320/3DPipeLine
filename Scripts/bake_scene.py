@@ -9,7 +9,7 @@
 
 烘焙流程从 bake.py 的 bake_high_to_low() 提取，
 去掉减面/导入/对齐步骤，仅保留：
-  Smart UV → 创建烘焙图 → 材质节点 → Cycles 配置 → 烘焙 Albedo(EMIT) + Normal → 资源隔离
+  缩裹(Shrinkwrap) → Smart UV → 创建烘焙图 → 材质节点 → Cycles 配置 → 烘焙 Albedo(EMIT) + Normal → 资源隔离
 
 用法：
     from bake_scene import bake_scene
@@ -25,6 +25,7 @@
 - Albedo 必须用 EMIT 烘焙（禁用 DIFFUSE）
 - cage=0.1, res=4096, samples=64, Cycles+GPU
 - Smart UV island_margin=0.01
+- 烘焙前自动缩裹（Shrinkwrap）低模到高模表面
 """
 
 import sys
@@ -119,6 +120,40 @@ def _validate_bbox_alignment(obj_high, obj_low, tol=0.5):
 # ============================================================
 # 烘焙辅助函数（从 bake.py 提取）
 # ============================================================
+def _apply_shrinkwrap(obj_high, obj_low):
+    """将低模缩裹(Shrinkwrap)到高模表面，确保烘焙时低模紧贴高模。
+
+    使用 NEAREST_SURFACEPOINT 方法，目标为高模对象，模式为 ON_SURFACE。
+    缩裹后低模的顶点会投影到高模最近表面点，改善烘焙精度。
+    """
+    import bpy
+
+    # 确保高低模可见
+    obj_high.hide_set(False)
+    obj_high.hide_viewport = False
+    obj_low.hide_set(False)
+    obj_low.hide_viewport = False
+
+    # 选择低模
+    for o in bpy.context.scene.objects:
+        o.select_set(False)
+    obj_low.select_set(True)
+    bpy.context.view_layer.objects.active = obj_low
+
+    if obj_low.mode != "OBJECT":
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+    # 添加缩裹修改器
+    shrinkwrap = obj_low.modifiers.new(name="ShrinkwrapBake", type='SHRINKWRAP')
+    shrinkwrap.target = obj_high
+    shrinkwrap.wrap_method = 'NEAREST_SURFACEPOINT'
+    shrinkwrap.wrap_mode = 'ON_SURFACE'
+
+    # 应用修改器
+    bpy.ops.object.modifier_apply(modifier=shrinkwrap.name)
+    print(f"    Shrinkwrap applied: '{obj_low.name}' → '{obj_high.name}' (NEAREST_SURFACEPOINT)")
+
+
 def _setup_smart_uv(obj, margin=DEFAULT_UV_MARGIN):
     """给低模做 Smart UV Project。
 
@@ -281,6 +316,7 @@ def bake_scene(
     device: str = DEFAULT_DEVICE,
     uv_margin: float = DEFAULT_UV_MARGIN,
     skip_uv: bool = False,
+    skip_shrinkwrap: bool = False,
     max_ray_dist: float = 0.0,
 ):
     """
@@ -308,6 +344,8 @@ def bake_scene(
         Smart UV island margin（默认 0.01）
     skip_uv : bool
         跳过 Smart UV（低模已有 UV 时设为 True）
+    skip_shrinkwrap : bool
+        跳过缩裹（低模已紧贴高模时设为 True）
     max_ray_dist : float
         最大射线距离，0=无限制
 
@@ -323,6 +361,7 @@ def bake_scene(
     print(f"  Low:    {low_obj_name} (场景对象)")
     print(f"  Params: cage={cage}, res={res}, samples={samples}, device={device}")
     print(f"  UV:     island_margin={uv_margin} {'(skip)' if skip_uv else ''}")
+    print(f"  Wrap:   shrinkwrap={'OFF' if skip_shrinkwrap else 'ON (NEAREST_SURFACEPOINT)'}")
     print(f"{'='*70}\n")
 
     # === 0. 预清理：删除残留的同名烘焙数据 ===
@@ -370,20 +409,29 @@ def bake_scene(
     if not ok:
         print(f"    [WARN] BBox 未对齐，烘焙可能出错！")
 
-    # === 4. Smart UV ===
+    # === 4. 缩裹（Shrinkwrap）低模到高模表面 ===
+    if not skip_shrinkwrap:
+        print("[4] Shrinkwrap: projecting low-poly onto high-poly surface...")
+        _apply_shrinkwrap(obj_high, obj_low)
+        # 缩裹后更新面数记录
+        actual_faces = len(obj_low.data.polygons)
+    else:
+        print("[4] Skipping Shrinkwrap (skip_shrinkwrap=True)")
+
+    # === 5. Smart UV ===
     if not skip_uv:
-        print(f"[4] Smart UV Project (island_margin={uv_margin})...")
+        print(f"[5] Smart UV Project (island_margin={uv_margin})...")
         _setup_smart_uv(obj_low, margin=uv_margin)
     else:
-        print("[4] Skipping UV (skip_uv=True)")
+        print("[5] Skipping UV (skip_uv=True)")
 
     ok, msg = _validate_uv(obj_low)
     print(f"    UV 校验: {msg}")
     if not ok:
         raise RuntimeError(f"[FATAL] UV 校验失败: {msg}")
 
-    # === 5. 创建烘焙图 ===
-    print(f"[5] Creating bake images ({res}x{res})...")
+    # === 6. 创建烘焙图 ===
+    print(f"[6] Creating bake images ({res}x{res})...")
     img_albedo = _make_bake_image(
         f"bake_{name}_albedo", "sRGB", (1, 1, 1, 1), False, res
     )
@@ -391,8 +439,8 @@ def bake_scene(
         f"bake_{name}_normal", "Non-Color", (0.5, 0.5, 1, 1), True, res
     )
 
-    # === 6. 低模材质 + 节点树 ===
-    print("[6] Setting up low-poly material...")
+    # === 7. 低模材质 + 节点树 ===
+    print("[7] Setting up low-poly material...")
     mat = bpy.data.materials.new(f"bake_{name}")
     mat.use_nodes = True
     nt = mat.node_tree
@@ -429,8 +477,8 @@ def bake_scene(
     obj_low.data.materials.clear()
     obj_low.data.materials.append(mat)
 
-    # === 7. Cycles 配置 ===
-    print(f"[7] Configuring Cycles (cage={cage})...")
+    # === 8. Cycles 配置 ===
+    print(f"[8] Configuring Cycles (cage={cage})...")
     scn = bpy.context.scene
     scn.render.engine = "CYCLES"
     scn.cycles.device = device
@@ -446,24 +494,24 @@ def bake_scene(
 
     scn.render.bake.normal_space = 'TANGENT'
 
-    # === 8. 烘焙 Albedo (EMIT) ===
-    print("[8] Baking Albedo via EMIT...")
+    # === 9. 烘焙 Albedo (EMIT) ===
+    print("[9] Baking Albedo via EMIT...")
     _emit_bake_albedo(obj_high, obj_low, img_albedo, nt, n_alb)
 
-    # === 9. 烘焙 Normal ===
-    print("[9] Baking Normal...")
+    # === 10. 烘焙 Normal ===
+    print("[10] Baking Normal...")
     _bake_normal(obj_high, obj_low, img_normal, nt, n_norm)
 
-    # === 10. 打包烘焙图 ===
-    print("[10] Packing bake images into .blend...")
+    # === 11. 打包烘焙图 ===
+    print("[11] Packing bake images into .blend...")
     try:
         img_albedo.pack()
         img_normal.pack()
     except Exception as e:
         print(f"    Pack warning (non-critical): {e}")
 
-    # === 11. 隔离高模资源防止污染 ===
-    print("[11] Isolating high-poly resources to prevent pollution...")
+    # === 12. 隔离高模资源防止污染 ===
+    print("[12] Isolating high-poly resources to prevent pollution...")
     iso_prefix = f"__baked_{name}__"
 
     high_images = set()
@@ -542,6 +590,7 @@ def main():
     p.add_argument("--device", default=DEFAULT_DEVICE, choices=["CPU", "GPU"])
     p.add_argument("--uv_margin", type=float, default=DEFAULT_UV_MARGIN)
     p.add_argument("--skip_uv", action="store_true", help="跳过 Smart UV")
+    p.add_argument("--skip_shrinkwrap", action="store_true", help="跳过缩裹")
     p.add_argument("--max_ray_dist", type=float, default=0.0)
 
     args = p.parse_args(argv)
@@ -555,6 +604,7 @@ def main():
         device=args.device,
         uv_margin=args.uv_margin,
         skip_uv=args.skip_uv,
+        skip_shrinkwrap=args.skip_shrinkwrap,
         max_ray_dist=args.max_ray_dist,
     )
 
