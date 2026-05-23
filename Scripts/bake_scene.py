@@ -108,13 +108,29 @@ def _validate_uv(obj_low):
 
 
 def _validate_bbox_alignment(obj_high, obj_low, tol=0.5):
-    """校验高低模 BBox 是否对齐。"""
+    """校验高低模 BBox 是否对齐。
+
+    比较世界空间下的轴对齐包围盒(AABB)，而非按角点索引比较，
+    这样即使高低模旋转状态不同（如 OBJ 导入带 90° X 旋转），
+    只要世界坐标下重合，校验就能通过。
+    """
     import mathutils
     h_bb = [obj_high.matrix_world @ mathutils.Vector(c) for c in obj_high.bound_box]
     l_bb = [obj_low.matrix_world @ mathutils.Vector(c) for c in obj_low.bound_box]
-    max_diff = max((h_bb[i] - l_bb[i]).length for i in range(8))
+
+    # 计算世界空间 AABB
+    h_min = mathutils.Vector((min(v.x for v in h_bb), min(v.y for v in h_bb), min(v.z for v in h_bb)))
+    h_max = mathutils.Vector((max(v.x for v in h_bb), max(v.y for v in h_bb), max(v.z for v in h_bb)))
+    l_min = mathutils.Vector((min(v.x for v in l_bb), min(v.y for v in l_bb), min(v.z for v in l_bb)))
+    l_max = mathutils.Vector((max(v.x for v in l_bb), max(v.y for v in l_bb), max(v.z for v in l_bb)))
+
+    max_diff = max(
+        abs(h_min.x - l_min.x), abs(h_max.x - l_max.x),
+        abs(h_min.y - l_min.y), abs(h_max.y - l_max.y),
+        abs(h_min.z - l_min.z), abs(h_max.z - l_max.z),
+    )
     ok = max_diff < tol
-    return ok, f"BBox max diff={max_diff:.4f} ({'OK' if ok else 'MISMATCH'})"
+    return ok, f"BBox AABB max diff={max_diff:.4f} ({'OK' if ok else 'MISMATCH'})"
 
 
 # ============================================================

@@ -36,14 +36,15 @@ def _load_obj_open3d(filepath: str):
 
 
 def _save_obj(filepath: str, vertices: np.ndarray, faces: np.ndarray):
-    """使用 Open3D 保存为 OBJ 文件。"""
-    import open3d as o3d
-
+    """保存为 OBJ 文件（纯 numpy 写入，避免 Open3D write_triangle_mesh 在 macOS 上段错误）。"""
     os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
-    mesh = o3d.geometry.TriangleMesh()
-    mesh.vertices = o3d.utility.Vector3dVector(vertices)
-    mesh.triangles = o3d.utility.Vector3iVector(faces)
-    o3d.io.write_triangle_mesh(filepath, mesh)
+    with open(filepath, "w") as f:
+        f.write("# Decimated mesh (Open3D Quadric)\n")
+        for v in vertices:
+            f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+        for face in faces:
+            # OBJ 索引从 1 开始
+            f.write(f"f {face[0]+1} {face[1]+1} {face[2]+1}\n")
     print(f"    Saved: {filepath} ({len(vertices)} verts, {len(faces)} faces)")
 
 
@@ -122,6 +123,17 @@ def decimate_obj(
     # 保存
     out_verts = np.asarray(simplified.vertices, dtype=np.float32)
     out_faces = np.asarray(simplified.triangles, dtype=np.int32)
+
+    # Open3D 读 FBX 时会做 Y↔Z 轴交换（FBX Y-up → Open3D Z-up），
+    # 读 OBJ 时不会。为保持输出一致（Y-up，与 Blender OBJ 导出相同），
+    # 当输入是 FBX 时需要转回 Y-up：交换 Y↔Z 并翻转 Z 符号。
+    input_ext = os.path.splitext(input_path)[1].lower()
+    if input_ext == ".fbx":
+        out_verts = out_verts[:, [0, 2, 1]].copy()
+        out_verts[:, 2] *= -1
+        if verbose:
+            print("    Axis fix: FBX input detected, converted Z-up → Y-up for OBJ output")
+
     _save_obj(output_path, out_verts, out_faces)
 
     result = {

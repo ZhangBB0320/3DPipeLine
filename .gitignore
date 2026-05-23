@@ -4,6 +4,7 @@ Scripts/__pycache__/
 *.pyc
 
 # Output directory (baked textures, FBX, renders, etc.)
+output/
 outPut/
 
 # Bake preview/renders at root
