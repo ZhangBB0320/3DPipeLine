@@ -46,12 +46,14 @@
       - 内嵌纹理（path_mode='COPY' + embed_textures=True）
       - 仅导出选中对象
       - 应用修改器
-      - 坐标：Y-up（自动烘焙 Z-up→Y-up 轴转换，Unity 导入无需旋转）
+      - target="unity": Y-up（自动烘焙 Z-up→Y-up 轴转换，Unity 导入无需旋转）
+      - target="blender": Z-up（不做轴转换，Blender 原生坐标）
     OBJ:
       - 纯几何，不导出材质/纹理
       - 仅导出选中对象
       - 应用修改器
-      - 坐标：Y-up（Unity 兼容）
+      - target="unity": Y-up（Unity 兼容）
+      - target="blender": Z-up（Blender 原生坐标）
 """
 
 import os
@@ -198,16 +200,27 @@ def _reset_axis_conversion(objects):
         obj.rotation_euler = (0, 0, 0)
 
 
-def _export_fbx(objects, output_path, apply_transforms=True, verbose=True):
-    """导出为 FBX（内嵌纹理），自动烘焙轴转换以兼容 Unity。"""
+def _export_fbx(objects, output_path, apply_transforms=True, target="unity", verbose=True):
+    """导出为 FBX（内嵌纹理），根据 target 决定是否烘焙轴转换。
+
+    Parameters
+    ----------
+    target : str
+        "unity" — 烘焙 Z-up→Y-up 轴转换，导出 Y-up FBX（Unity 兼容）
+        "blender" — 不做轴转换，导出 Z-up FBX（Blender 原生坐标）
+    """
     import bpy
 
     if apply_transforms:
         print("    Applying transforms...")
         _apply_transforms(objects)
 
-    # 烘焙 Z-up → Y-up 轴转换，使 Unity 导入后方向正确
-    _bake_axis_conversion(objects, verbose=verbose)
+    # 仅 Unity 目标需要烘焙 Z-up → Y-up 轴转换
+    if target == "unity":
+        _bake_axis_conversion(objects, verbose=verbose)
+    else:
+        if verbose:
+            print("    Target=Blender: skipping axis conversion (Z-up native)")
 
     _select_objects(objects)
 
@@ -229,6 +242,12 @@ def _export_fbx(objects, output_path, apply_transforms=True, verbose=True):
     # 确保输出目录存在
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
+    # 根据目标平台设置轴方向
+    if target == "unity":
+        axis_forward, axis_up = "-Z", "Y"    # Y-up（Unity 标准）
+    else:
+        axis_forward, axis_up = "-Y", "Z"    # Z-up（Blender 原生）
+
     kwargs = dict(
         filepath=output_path,
         use_selection=True,
@@ -241,15 +260,16 @@ def _export_fbx(objects, output_path, apply_transforms=True, verbose=True):
         # 材质/动画
         use_custom_props=True,
         add_leaf_bones=False,
-        # 显式设置轴方向，确保 Y-up（Unity 标准）
-        axis_forward="-Z",
-        axis_up="Y",
+        # 轴方向
+        axis_forward=axis_forward,
+        axis_up=axis_up,
     )
 
     bpy.ops.export_scene.fbx(**kwargs)
 
-    # 导出后清理对象旋转（恢复为 0,0,0）
-    _reset_axis_conversion(objects)
+    # 导出后清理对象旋转（仅 Unity 目标做了轴转换，需要恢复）
+    if target == "unity":
+        _reset_axis_conversion(objects)
 
     n_faces = sum(len(o.data.polygons) for o in objects)
     n_verts = sum(len(o.data.vertices) for o in objects)
@@ -257,7 +277,7 @@ def _export_fbx(objects, output_path, apply_transforms=True, verbose=True):
     print(f"    Path: {output_path}")
 
 
-def _export_obj(objects, output_path, apply_transforms=True, verbose=True):
+def _export_obj(objects, output_path, apply_transforms=True, target="unity", verbose=True):
     """导出为 OBJ（纯几何，无材质/纹理）。"""
     import bpy
 
@@ -271,6 +291,11 @@ def _export_obj(objects, output_path, apply_transforms=True, verbose=True):
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
+    if target == "unity":
+        forward_axis, up_axis = "NEGATIVE_Z", "Y"
+    else:
+        forward_axis, up_axis = "NEGATIVE_Y", "Z"
+
     kwargs = dict(
         filepath=output_path,
         # 不导出材质
@@ -280,8 +305,8 @@ def _export_obj(objects, output_path, apply_transforms=True, verbose=True):
         # 导出 UV（保留展开信息，对后续烘焙有用）
         export_uv=True,
         # 坐标
-        forward_axis="NEGATIVE_Z",
-        up_axis="Y",
+        forward_axis=forward_axis,
+        up_axis=up_axis,
     )
 
     bpy.ops.wm.obj_export(**kwargs)
@@ -297,6 +322,7 @@ def export_model(
     output_path,
     fmt="auto",
     output_name="",
+    target="unity",
     apply_transforms=True,
     verbose=True,
 ):
@@ -319,6 +345,10 @@ def export_model(
     output_name : str
         自定义导出文件名（不含扩展名）。提供后覆盖 output_path 中的文件名部分，
         目录仍取自 output_path。例：output_name="my_house" → my_house.fbx
+    target : str
+        目标平台：
+        - "unity" — 烘焙 Z-up→Y-up 轴转换，导出 Y-up 文件（Unity 兼容）
+        - "blender" — 不做轴转换，导出 Z-up 文件（Blender 原生坐标）
     apply_transforms : bool
         导出前是否应用变换（location/rotation/scale → 0）。
         默认 True，确保导出坐标干净。
@@ -366,14 +396,15 @@ def export_model(
     print(f"EXPORT: {resolved_fmt.upper()}")
     print(f"  Objects: {[o.name for o in objects]}")
     print(f"  Output:  {resolved_path}")
+    print(f"  Target:  {target} ({'Y-up, axis conversion' if target == 'unity' else 'Z-up, native coords'})")
     print(f"  Textures: {'yes (embedded)' if resolved_fmt == 'fbx' else 'no'}")
     print("=" * 70)
 
     # 执行导出
     if resolved_fmt == "fbx":
-        _export_fbx(objects, resolved_path, apply_transforms=apply_transforms, verbose=verbose)
+        _export_fbx(objects, resolved_path, apply_transforms=apply_transforms, target=target, verbose=verbose)
     else:
-        _export_obj(objects, resolved_path, apply_transforms=apply_transforms, verbose=verbose)
+        _export_obj(objects, resolved_path, apply_transforms=apply_transforms, target=target, verbose=verbose)
 
     n_verts = sum(len(o.data.vertices) for o in objects)
     n_faces = sum(len(o.data.polygons) for o in objects)
@@ -398,6 +429,7 @@ def export_model(
 def export_all_meshes(
     output_dir,
     fmt="auto",
+    target="unity",
     apply_transforms=True,
     name_pattern="{name}",
     verbose=True,
@@ -411,6 +443,8 @@ def export_all_meshes(
         输出目录，不存在则自动创建。
     fmt : str
         导出格式（同 export_model 的 fmt 参数）。
+    target : str
+        目标平台："unity" 或 "blender"。
     apply_transforms : bool
         导出前是否应用变换。
     name_pattern : str
@@ -444,6 +478,7 @@ def export_all_meshes(
                 obj_names=[obj.name],
                 output_path=out_path,
                 fmt=fmt,
+                target=target,
                 apply_transforms=apply_transforms,
                 verbose=verbose,
             )
@@ -481,6 +516,9 @@ def main():
     p.add_argument("-f", "--format", default="auto",
                    choices=["fbx", "obj", "auto"],
                    help="导出格式（默认 auto：有纹理→FBX，无纹理→OBJ）")
+    p.add_argument("-t", "--target", default="unity",
+                   choices=["unity", "blender"],
+                   help="目标平台：unity=Y-up+轴转换，blender=Z-up+原生坐标（默认 unity）")
     p.add_argument("--no-apply-transforms", action="store_true",
                    help="导出前不应用变换")
     args = p.parse_args(argv)
@@ -490,6 +528,7 @@ def main():
         output_path=args.output,
         fmt=args.format,
         output_name=args.name,
+        target=args.target,
         apply_transforms=not args.no_apply_transforms,
     )
 
