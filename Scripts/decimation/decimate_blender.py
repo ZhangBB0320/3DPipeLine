@@ -1,28 +1,33 @@
 #!/usr/bin/env python3
 """
-Blender 内减面脚本 — 复制高模 → Decimate COLLAPSE → 二分法精确控面数。
+Blender 内减面脚本 — 复制高模 → Decimate COLLAPSE → 二分法精确控面数 → 可选流形修复。
 
 不负责导入、烘焙、导出，只做减面。适用于：
   - 已在 Blender 场景中的高模对象
   - 需要精确控制目标面数的减面
+  - 需要拓扑干净的流形网格（3D 打印、物理引擎等）
 
 减面流程从 bake.py 的 _decimate_with_retry() 提取，
 去掉烘焙相关步骤，仅保留：
-  复制高模 → Decimate modifier → 二分法调整 ratio → 清理材质 → 返回低模
+  复制高模 → Decimate modifier → 二分法调整 ratio → 流形修复(可选) → 清理材质 → 返回低模
 
 用法：
     from decimate_blender import decimate_blender
 
-    # 场景中已有 building1 高模
+    # 场景中已有 building1 高模（默认启用流形修复）
     low_name, actual_faces = decimate_blender("building1", target_faces=3000)
 
     # 自定义低模名称
     decimate_blender("building1", target_faces=3000, name="MyHouse")
 
+    # 禁用流形修复（旧行为）
+    decimate_blender("building1", target_faces=3000, repair_mesh=False)
+
 核心规则（同 bake.py）：
 - 使用 COLLAPSE 模式
 - 面数不精确时自动二分法搜索
 - 连续 3 次面数相同则提前退出（COLLAPSE 已到拓扑下限）
+- 减面后可选流形修复：删除退化面 / 删除非流形边 / 删除松散几何 / 合并重叠顶点 / 重算法线
 - 减面后清空低模材质（烘焙时会重新赋材质）
 """
 
@@ -30,7 +35,8 @@ import sys
 
 # 统一参数
 DEFAULT_TARGET_FACES = 3000
-DEFAULT_TOLERANCE = 0.1  # 面数允许误差 10%
+DEFAULT_TOLERANCE = 0.1   # 面数允许误差 10%
+DEFAULT_MERGE_DISTANCE = 0.0001  # 流形修复：合并重叠顶点距离阈值
 
 
 def decimate_blender(
@@ -38,9 +44,11 @@ def decimate_blender(
     target_faces: int = DEFAULT_TARGET_FACES,
     tolerance: float = DEFAULT_TOLERANCE,
     name: str = None,
+    repair_mesh: bool = True,
+    merge_distance: float = DEFAULT_MERGE_DISTANCE,
 ):
     """
-    Blender 内减面：复制高模 → Decimate COLLAPSE → 二分法调整。
+    Blender 内减面：复制高模 → Decimate COLLAPSE → 二分法调整 → 可选流形修复。
 
     Parameters
     ----------
@@ -52,6 +60,11 @@ def decimate_blender(
         允许的面数误差比例（默认 0.1 = 10%）。
     name : str
         低模名称前缀。若不提供，则用高模名去掉可能的 _High 后缀。
+    repair_mesh : bool
+        减面后是否进行流形修复（默认 True）。
+        包括：删除退化面 / 删除非流形边 / 删除松散几何 / 合并重叠顶点 / 重算法线。
+    merge_distance : float
+        合并重叠顶点的距离阈值（默认 0.0001），仅在 repair_mesh=True 时生效。
 
     Returns
     -------
@@ -65,6 +78,7 @@ def decimate_blender(
     print(f"DECIMATE (Blender)")
     print(f"  High:   {high_obj_name}")
     print(f"  Target: {target_faces} faces (tolerance={tolerance:.0%})")
+    print(f"  Repair: {'ON' if repair_mesh else 'OFF'}")
     print(f"{'='*70}\n")
 
     obj_high = bpy.data.objects.get(high_obj_name)
@@ -102,15 +116,124 @@ def decimate_blender(
         obj_high, target_faces=target_faces, tolerance=tolerance, name=name
     )
 
-    # === 4. 清空低模材质（烘焙时会重新赋材质）===
+    # === 4. 流形修复（可选）===
+    if repair_mesh:
+        print("[4] Repairing mesh (manifold cleanup)...")
+        actual_faces = _repair_mesh(obj_low, merge_distance=merge_distance)
+    else:
+        print("[4] Mesh repair: SKIPPED")
+
+    # === 5. 清空低模材质（烘焙时会重新赋材质）===
     obj_low.data.materials.clear()
 
-    # === 5. 完成 ===
+    # === 6. 完成 ===
     print(f"\n[DONE] Decimation complete:")
     print(f"    Low-poly: '{obj_low.name}' — {actual_faces} faces")
     print(f"    High-poly: '{obj_high.name}' — {high_faces} faces (preserved)")
 
     return obj_low.name, actual_faces
+
+
+def _repair_mesh(obj, merge_distance=DEFAULT_MERGE_DISTANCE, verbose=True):
+    """3D 打印工具集 — 流形修复。
+
+    减面完成后调用，依次执行：
+      1. 删除退化面（零面积 / 零法线）
+      2. 删除非流形边（>2 面共享的边 + 松散边）
+      3. 删除松散顶点和松散边
+      4. 合并重叠顶点（by distance）
+      5. 重新计算法线
+
+    Returns
+    -------
+    int : 修复后的面数
+    """
+    import bpy
+    import bmesh
+
+    faces_before = len(obj.data.polygons)
+
+    # 确保对象可选、可见、OBJECT 模式
+    obj.hide_set(False)
+    obj.hide_viewport = False
+    for o in bpy.context.scene.objects:
+        o.select_set(False)
+    obj.select_set(True)
+    bpy.context.view_layer.objects.active = obj
+    if obj.mode != "OBJECT":
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+
+    # --- 1. 删除退化面（面积≈0 或 法线≈0）---
+    degenerate_faces = []
+    for face in bm.faces:
+        if face.calc_area() < 1e-12 or face.normal.length < 1e-6:
+            degenerate_faces.append(face)
+    if degenerate_faces:
+        bmesh.ops.delete(bm, geom=degenerate_faces, context='FACES')
+        if verbose:
+            print(f"    [Repair] Removed {len(degenerate_faces)} degenerate faces")
+
+    # --- 2. 删除非流形边（>2 面共享的边 + 只连 1 面的内部边）---
+    non_manifold_edges = []
+    for edge in bm.edges:
+        if not edge.is_manifold and not edge.is_boundary:
+            non_manifold_edges.append(edge)
+    if non_manifold_edges:
+        nm_faces = set()
+        for edge in non_manifold_edges:
+            for face in edge.link_faces:
+                nm_faces.add(face)
+        if nm_faces:
+            bmesh.ops.delete(bm, geom=list(nm_faces), context='FACES')
+        if verbose:
+            print(f"    [Repair] Removed {len(non_manifold_edges)} non-manifold edges "
+                  f"({len(nm_faces)} faces)")
+
+    # --- 3. 删除松散几何（无面引用的边和顶点）---
+    loose_verts = []
+    for vert in bm.verts:
+        if not vert.link_faces:
+            loose_verts.append(vert)
+    loose_edges = []
+    for edge in bm.edges:
+        if not edge.link_faces:
+            loose_edges.append(edge)
+
+    if loose_edges:
+        bmesh.ops.delete(bm, geom=loose_edges, context='EDGES')
+    if loose_verts:
+        remaining_loose = [v for v in bm.verts if not v.link_faces and not v.link_edges]
+        if remaining_loose:
+            bmesh.ops.delete(bm, geom=remaining_loose, context='VERTS')
+    loose_total = len(loose_verts) + len(loose_edges)
+    if verbose and loose_total > 0:
+        print(f"    [Repair] Removed {len(loose_edges)} loose edges, {len(loose_verts)} loose verts")
+
+    # --- 4. 合并重叠顶点（by distance）---
+    if merge_distance > 0:
+        verts_before_merge = len(bm.verts)
+        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=merge_distance)
+        merged = verts_before_merge - len(bm.verts)
+        if verbose and merged > 0:
+            print(f"    [Repair] Merged {merged} overlapping verts (dist={merge_distance})")
+
+    # --- 5. 重新计算法线 ---
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+
+    # 写回 mesh
+    bm.to_mesh(obj.data)
+    bm.free()
+    obj.data.update()
+
+    faces_after = len(obj.data.polygons)
+    if verbose and faces_after != faces_before:
+        print(f"    [Repair] Faces: {faces_before:,} → {faces_after:,} "
+              f"({faces_before - faces_after:,} removed)")
+
+    return faces_after
 
 
 def _decimate_with_retry(obj_high, target_faces=DEFAULT_TARGET_FACES,
@@ -221,6 +344,10 @@ def main():
     p.add_argument("--tolerance", type=float, default=DEFAULT_TOLERANCE,
                    help=f"面数允许误差（默认 {DEFAULT_TOLERANCE}）")
     p.add_argument("--name", default=None, help="低模名称前缀（默认=高模名去掉_High）")
+    p.add_argument("--no_repair", action="store_true",
+                   help="禁用流形修复（默认启用）")
+    p.add_argument("--merge_distance", type=float, default=DEFAULT_MERGE_DISTANCE,
+                   help=f"合并重叠顶点距离阈值（默认 {DEFAULT_MERGE_DISTANCE}）")
     args = p.parse_args(argv)
 
     decimate_blender(
@@ -228,6 +355,8 @@ def main():
         target_faces=args.target_faces,
         tolerance=args.tolerance,
         name=args.name,
+        repair_mesh=not args.no_repair,
+        merge_distance=args.merge_distance,
     )
 
 
