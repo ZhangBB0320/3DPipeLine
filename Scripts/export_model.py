@@ -46,11 +46,12 @@
       - 内嵌纹理（path_mode='COPY' + embed_textures=True）
       - 仅导出选中对象
       - 应用修改器
-      - 坐标：Y-up（Blender 默认）
+      - 坐标：Y-up（自动烘焙 Z-up→Y-up 轴转换，Unity 导入无需旋转）
     OBJ:
       - 纯几何，不导出材质/纹理
       - 仅导出选中对象
       - 应用修改器
+      - 坐标：Y-up（Unity 兼容）
 """
 
 import os
@@ -161,13 +162,52 @@ def _select_objects(objects):
     bpy.context.view_layer.objects.active = objects[0]
 
 
+def _bake_axis_conversion(objects, verbose=True):
+    """将 Blender Z-up → Y-up 轴转换烘焙进顶点，使导出的 FBX 在 Unity 中无需旋转。
+
+    原理：
+      1. 对每个对象施加 -90° X 旋转（Z-up → Y-up）并 apply，将轴转换烘焙进顶点
+      2. 设置 +90° X 旋转，抵消 FBX 导出器自动施加的 -90° X 轴转换
+      结果：FBX 中顶点为 Y-up，对象旋转为 identity，Unity 导入后方向正确
+    """
+    import bpy
+    import math
+
+    if verbose:
+        print("    Baking Z-up → Y-up axis conversion for Unity...")
+
+    for obj in objects:
+        bpy.ops.object.select_all(action="DESELECT")
+        obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
+        # Step 1: 旋转 -90° X (Z-up → Y-up) 并烘焙进顶点
+        obj.rotation_euler = (math.radians(-90), 0, 0)
+        bpy.ops.object.transform_apply(rotation=True)
+        # Step 2: 设 +90° X 抵消导出器的轴转换（导出器会施加 -90° X）
+        obj.rotation_euler = (math.radians(90), 0, 0)
+
+    if verbose:
+        print("    Axis conversion baked into vertices.")
+
+
+def _reset_axis_conversion(objects):
+    """导出后清理：将对象旋转重置为 (0,0,0)。"""
+    import bpy
+
+    for obj in objects:
+        obj.rotation_euler = (0, 0, 0)
+
+
 def _export_fbx(objects, output_path, apply_transforms=True, verbose=True):
-    """导出为 FBX（内嵌纹理）。"""
+    """导出为 FBX（内嵌纹理），自动烘焙轴转换以兼容 Unity。"""
     import bpy
 
     if apply_transforms:
         print("    Applying transforms...")
         _apply_transforms(objects)
+
+    # 烘焙 Z-up → Y-up 轴转换，使 Unity 导入后方向正确
+    _bake_axis_conversion(objects, verbose=verbose)
 
     _select_objects(objects)
 
@@ -201,9 +241,15 @@ def _export_fbx(objects, output_path, apply_transforms=True, verbose=True):
         # 材质/动画
         use_custom_props=True,
         add_leaf_bones=False,
+        # 显式设置轴方向，确保 Y-up（Unity 标准）
+        axis_forward="-Z",
+        axis_up="Y",
     )
 
     bpy.ops.export_scene.fbx(**kwargs)
+
+    # 导出后清理对象旋转（恢复为 0,0,0）
+    _reset_axis_conversion(objects)
 
     n_faces = sum(len(o.data.polygons) for o in objects)
     n_verts = sum(len(o.data.vertices) for o in objects)
