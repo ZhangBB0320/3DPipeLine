@@ -1,0 +1,74 @@
+{
+  "description": "动画伤害点数据 - 各攻击动画在1.0x速率下的视觉命中时机",
+  "methodology": "综合右臂角度峰值(Right Arm Down-Up)与右手世界空间最大速度(RightHandT)确定",
+  "note": "hitPercent 需进游戏目视确认，当前值为程序分析估算值",
+  "animations": {
+    "Fight_Attack1": {
+      "source": "Assets/Res/Fbx/LowBody_full.fbx",
+      "animDuration": 2.266667,
+      "frameRate": 30,
+      "rightArmPeak": { "time": 0.800, "percent": 0.353, "value": 0.41 },
+      "rightHandMaxSpeed": { "time": 0.825, "percent": 0.364, "speed": 5.82 },
+      "hitPercent": 0.36,
+      "hitTime": 0.816,
+      "note": "单次横挥，前摇短后摇长"
+    },
+    "Fight_Attack2": {
+      "source": "Assets/Res/Fbx/LowBody_full.fbx",
+      "animDuration": 2.4,
+      "frameRate": 30,
+      "rightArmPeak": { "time": 0.700, "percent": 0.292, "value": 0.41 },
+      "rightHandMaxSpeed": { "time": 0.990, "percent": 0.412, "speed": 5.30 },
+      "hitPercent": 0.40,
+      "hitTime": 0.96,
+      "note": "单次劈砍，右臂峰值偏早，最大速度偏晚，hitPercent经目视确认调整为0.40"
+    },
+    "Fight_Attack3": {
+      "source": "Assets/Res/Fbx/LowBody_full.fbx",
+      "animDuration": 4.2,
+      "frameRate": 30,
+      "rightArmPeak": { "time": 2.000, "percent": 0.476, "value": 0.52 },
+      "rightHandMaxSpeed": { "time": 2.640, "percent": 0.629, "speed": 4.93 },
+      "hitPercent": 0.50,
+      "hitTime": 2.1,
+      "note": "多段连击(3段)，曲线有多次峰值，首段命中约50%处，后续段需单独标注"
+    },
+    "Fight_Attack5": {
+      "source": "Assets/Res/Fbx/LowBody_full.fbx",
+      "animDuration": 2.733334,
+      "frameRate": 30,
+      "rightArmPeak": { "time": 0.867, "percent": 0.317, "value": 0.33 },
+      "rightHandMaxSpeed": { "time": 1.023, "percent": 0.374, "speed": 5.06 },
+      "hitPercent": 0.34,
+      "hitTime": 0.929,
+      "note": "单次重击，前摇较长"
+    }
+  },
+  "formula": {
+    "description": "攻击配表计算公式",
+    "inputs": {
+      "animDuration": "动画原始时长(1.0x速率)",
+      "hitPercent": "伤害触发百分比",
+      "totalCycle": "期望总攻击周期(秒)",
+      "animRatio": "动画压缩系数(默认0.8)"
+    },
+    "outputs": {
+      "animPlayDuration": "totalCycle * animRatio",
+      "hitTime": "animPlayDuration * hitPercent (即 TimeLines[0])",
+      "cd": "totalCycle - hitTime",
+      "animSpeed": "animDuration / animPlayDuration"
+    },
+    "example_axe_attack1_1s": {
+      "weapon": "斧头",
+      "animName": "Fight_Attack1",
+      "animDuration": 2.266667,
+      "hitPercent": 0.36,
+      "desiredAnimPlayDuration": 1.0,
+      "totalCycle": 1.25,
+      "animRatio": 0.8,
+      "hitTime(TimeLines[0])": 0.36,
+      "cd": 0.89,
+      "animSpeed": 2.267
+    }
+  }
+}
