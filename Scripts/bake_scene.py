@@ -32,7 +32,7 @@ import sys
 import os
 
 # 统一参数（与 bake.py 一致）
-DEFAULT_CAGE = 0.8
+DEFAULT_CAGE = 0.05
 DEFAULT_RES = 4096
 DEFAULT_SAMPLES = 64
 DEFAULT_DEVICE = "GPU"

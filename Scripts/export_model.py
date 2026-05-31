@@ -144,14 +144,18 @@ def _resolve_output_path(output_path: str, fmt: str, output_name: str = "") -> s
 
 
 def _apply_transforms(objects):
-    """对导出对象应用变换（location/rotation/scale），确保导出坐标正确。"""
+    """对导出对象应用变换（rotation/scale），确保导出坐标正确。
+
+    注意：不 apply location，以保留对象的原点位置（如 set_origin_to_bottom_center 设置的底部原点）。
+    如果 apply location，原点会被强制移到 (0,0,0)，导致底部原点变成几何中心。
+    """
     import bpy
 
     for obj in objects:
         bpy.ops.object.select_all(action="DESELECT")
         obj.select_set(True)
         bpy.context.view_layer.objects.active = obj
-        bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+        bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
 
 
 def _select_objects(objects):
@@ -495,6 +499,386 @@ def export_all_meshes(
             print(f"  [ERR] {r['object']}: {r['error']}")
         else:
             print(f"  [OK ] {r['objects'][0]} → {r['path']} ({r['format'].upper()})")
+
+    return results
+
+
+# ============================================================
+# 带骨骼角色导出
+# ============================================================
+
+
+def _compute_mesh_world_center(meshes):
+    """计算所有 mesh 的世界空间包围盒中心。"""
+    from mathutils import Vector
+
+    all_min = Vector((float("inf"),) * 3)
+    all_max = Vector((float("-inf"),) * 3)
+
+    for m in meshes:
+        for corner in m.bound_box:
+            world_corner = m.matrix_world @ Vector(corner)
+            for i in range(3):
+                all_min[i] = min(all_min[i], world_corner[i])
+                all_max[i] = max(all_max[i], world_corner[i])
+
+    return (all_min + all_max) / 2
+
+
+def _save_object_transforms(objects):
+    """保存对象的 location/rotation/scale 状态，用于后续恢复。
+
+    Returns
+    -------
+    dict : {object_name: (location, rotation_euler, scale)}
+    """
+    saved = {}
+    for obj in objects:
+        saved[obj.name] = (
+            obj.location.copy(),
+            obj.rotation_euler.copy(),
+            obj.scale.copy(),
+        )
+    return saved
+
+
+def _restore_object_transforms(saved, verbose=True):
+    """恢复对象的 location/rotation/scale 到保存的状态。
+
+    Parameters
+    ----------
+    saved : dict
+        _save_object_transforms 的返回值。
+    """
+    import bpy
+
+    for obj_name, (loc, rot, scale) in saved.items():
+        obj = bpy.data.objects.get(obj_name)
+        if obj is None:
+            if verbose:
+                print(f"    [WARN] restore: 对象 '{obj_name}' 不存在，跳过")
+            continue
+        obj.location = loc
+        obj.rotation_euler = rot
+        obj.scale = scale
+
+    if verbose:
+        print("    Restored object transforms (programmatic, no undo).")
+
+
+def _center_rigged_to_origin(arm, meshes, verbose=True):
+    """将带骨骼角色居中到世界原点。
+
+    策略：仅调整 armature 的 location，不做 transform_apply。
+
+    原因：Mixamo 导入的 armature 携带 rotation=(90°, 0, 0) 和
+    scale=(0.0053) 用于轴转换和单位换算。如果 transform_apply(rotation=True,
+    scale=True)，这些变换会被烘焙进骨骼 rest pose，导致 FBX 导出时
+    双重轴转换（Blender 导出器再叠加一次），骨骼位置全部错乱。
+
+    正确做法：
+    1. 计算 mesh 包围盒世界空间中心，确定 offset
+    2. arm.location += offset（子级 mesh 自动跟随）
+    3. 非子级 mesh 独立移动
+    4. 不做任何 transform_apply — armature 保留原始 rotation/scale，
+       骨骼数据不变
+    5. 导出后由调用方恢复 arm.location 即可（无需恢复骨骼/顶点数据）
+
+    子级 mesh 的 location 是相对于 armature 的 local space，
+    移动 armature 后子级 mesh 的世界位置自动更新，无需额外处理。
+    """
+    import bpy
+
+    center = _compute_mesh_world_center(meshes)
+
+    if verbose:
+        print(f"    Mesh bounding center: ({center.x:.4f}, {center.y:.4f}, {center.z:.4f})")
+        print(f"    Centering to origin: offset = -({center.x:.4f}, {center.y:.4f}, {center.z:.4f})")
+
+    offset = -center
+
+    # 区分子级 mesh 和非子级 mesh
+    child_meshes = [m for m in meshes if m.parent == arm]
+    non_child_meshes = [m for m in meshes if m.parent != arm]
+
+    if verbose and child_meshes:
+        print(f"    Child meshes (follow armature): {[m.name for m in child_meshes]}")
+    if verbose and non_child_meshes:
+        print(f"    Non-child meshes (move independently): {[m.name for m in non_child_meshes]}")
+
+    # 移动 armature（子级 mesh 自动跟随）+ 非子级 mesh 独立移动
+    arm.location += offset
+    for m in non_child_meshes:
+        m.location += offset
+
+    # 刷新 depsgraph 确保包围盒更新
+    bpy.context.view_layer.update()
+
+    if verbose:
+        new_center = _compute_mesh_world_center(meshes)
+        print(f"    After centering: mesh center = ({new_center.x:.6f}, {new_center.y:.6f}, {new_center.z:.6f})")
+
+
+def export_rigged_model(
+    armature_name,
+    output_path,
+    mesh_names=None,
+    output_name="",
+    target="unity",
+    move_to_origin=True,
+    verbose=True,
+):
+    """
+    导出带骨骼的角色模型为 FBX（内嵌纹理）。
+
+    自动查找骨架的子级 mesh，导出骨架+mesh 为 FBX。
+
+    Parameters
+    ----------
+    armature_name : str
+        骨架（ARMATURE）对象名称。
+    output_path : str
+        输出文件路径。
+    mesh_names : list[str] or None
+        要导出的 mesh 名称列表。None 则自动取骨架的所有子级 MESH。
+    output_name : str
+        自定义导出文件名（不含扩展名）。
+    target : str
+        目标平台："unity"（Y-up）或 "blender"（Z-up）。
+    move_to_origin : bool
+        是否将角色居中到原点后导出。True 时仅调整 armature.location 将角色
+        居中到世界原点（不做 transform_apply，不破坏骨骼 rest pose），
+        导出后程序化恢复对象 location。False 时直接导出当前位置。
+    verbose : bool
+        是否输出详细日志。
+
+    Returns
+    -------
+    dict : {
+        "format": "fbx",
+        "path": str,
+        "armature": str,
+        "meshes": list[str],
+        "n_verts": int,
+        "n_faces": int,
+    }
+    """
+    import bpy
+
+    # 查找骨架
+    arm = bpy.data.objects.get(armature_name)
+    if arm is None:
+        raise RuntimeError(f"骨架对象 '{armature_name}' 不存在")
+    if arm.type != "ARMATURE":
+        raise RuntimeError(f"对象 '{armature_name}' 类型为 {arm.type}（非 ARMATURE）")
+
+    # 收集 mesh
+    if mesh_names is not None:
+        meshes = []
+        for mn in mesh_names:
+            m = bpy.data.objects.get(mn)
+            if m is None:
+                if verbose:
+                    print(f"    [WARN] mesh '{mn}' 不存在，跳过")
+                continue
+            if m.type != "MESH":
+                if verbose:
+                    print(f"    [WARN] 对象 '{mn}' 类型为 {m.type}（非 MESH），跳过")
+                continue
+            meshes.append(m)
+    else:
+        # 自动取骨架的所有子级 MESH + 通过 Armature modifier 绑定的 mesh
+        meshes = [c for c in arm.children if c.type == "MESH"]
+        for obj in bpy.data.objects:
+            if obj.type == "MESH" and obj not in meshes:
+                for mod in obj.modifiers:
+                    if mod.type == "ARMATURE" and mod.object == arm:
+                        meshes.append(obj)
+                        break
+
+    if not meshes:
+        raise RuntimeError(f"骨架 '{armature_name}' 没有可导出的 MESH 子级")
+
+    # 解析输出路径
+    resolved_path = _resolve_output_path(output_path, "fbx", output_name=output_name)
+
+    print("=" * 70)
+    print(f"EXPORT RIGGED: FBX (embedded textures)")
+    print(f"  Armature:      {arm.name}")
+    print(f"  Meshes:        {[m.name for m in meshes]}")
+    print(f"  Output:        {resolved_path}")
+    print(f"  Target:        {target} ({'Y-up' if target == 'unity' else 'Z-up'})")
+    print(f"  Move to origin: {move_to_origin}")
+    print("=" * 70)
+
+    # 居中前：保存对象变换（新方案不修改骨骼/顶点数据，只需恢复 location）
+    saved_transforms = None
+
+    if move_to_origin:
+        if verbose:
+            print("    Saving object transforms before centering...")
+        saved_transforms = _save_object_transforms([arm] + meshes)
+
+        _center_rigged_to_origin(arm, meshes, verbose=verbose)
+
+    # 选中骨架 + 所有 mesh
+    bpy.ops.object.select_all(action="DESELECT")
+    arm.select_set(True)
+    for m in meshes:
+        m.select_set(True)
+    bpy.context.view_layer.objects.active = arm
+
+    # 保存脏图像
+    if verbose:
+        print("    Saving unsaved images before export...")
+    for img in bpy.data.images:
+        if img.is_dirty:
+            try:
+                img.save()
+                if verbose:
+                    print(f"      Saved dirty image: {img.name}")
+            except Exception as e:
+                if verbose:
+                    print(f"      [WARN] Could not save image '{img.name}': {e}")
+
+    # 导出 FBX
+    os.makedirs(os.path.dirname(os.path.abspath(resolved_path)), exist_ok=True)
+
+    if target == "unity":
+        axis_forward, axis_up = "-Z", "Y"
+    else:
+        axis_forward, axis_up = "-Y", "Z"
+
+    print(f"    Exporting rigged FBX (embedded textures) → {resolved_path}")
+
+    bpy.ops.export_scene.fbx(
+        filepath=resolved_path,
+        use_selection=True,
+        path_mode="COPY",
+        embed_textures=True,
+        use_mesh_modifiers=True,
+        mesh_smooth_type="FACE",
+        use_custom_props=True,
+        add_leaf_bones=False,
+        axis_forward=axis_forward,
+        axis_up=axis_up,
+    )
+
+    # 恢复：只需恢复对象变换（骨骼和顶点数据未被修改）
+    if move_to_origin:
+        if verbose:
+            print("    Restoring Blender scene (programmatic, no undo)...")
+        _restore_object_transforms(saved_transforms, verbose=verbose)
+
+    n_verts = sum(len(m.data.vertices) for m in meshes)
+    n_faces = sum(len(m.data.polygons) for m in meshes)
+
+    result = {
+        "format": "fbx",
+        "path": resolved_path,
+        "armature": arm.name,
+        "meshes": [m.name for m in meshes],
+        "n_verts": n_verts,
+        "n_faces": n_faces,
+    }
+
+    print(f"\n[DONE] Rigged export complete:")
+    print(f"    Format:   {result['format'].upper()}")
+    print(f"    Path:     {result['path']}")
+    print(f"    Armature: {result['armature']}")
+    print(f"    Meshes:   {result['meshes']}")
+    print(f"    Verts:    {result['n_verts']}, Faces: {result['n_faces']}")
+
+    return result
+
+
+def batch_export_rigged(
+    output_dir,
+    name_mesh_map=None,
+    target="unity",
+    move_to_origin=True,
+    verbose=True,
+):
+    """
+    批量导出场景中所有带骨骼的角色模型。
+
+    自动发现场景中的 ARMATURE 对象及其子级 MESH，对每个角色：
+    1. 将角色居中到原点（move_to_origin=True 时）
+    2. 导出为 FBX（内嵌纹理 + 骨架）
+    3. 恢复 Blender 场景原始状态
+
+    Parameters
+    ----------
+    output_dir : str
+        输出根目录。每个角色导出到 {output_dir}/{armature_name}/{armature_name}_Low.fbx。
+    name_mesh_map : dict or None
+        手动指定骨架名→mesh名列表的映射。None 则自动发现。
+        用于覆盖自动发现的 mesh 名称（如 Zombie2_Low_Mesh 等）。
+        注意：键中包含 "." 的骨架名（如 "FemaleHighSchooler1.001"）会被跳过，
+        除非在此映射中显式指定。
+    target : str
+        目标平台："unity" 或 "blender"。
+    move_to_origin : bool
+        是否将角色居中到原点后导出。
+    verbose : bool
+
+    Returns
+    -------
+    list[dict] : 每个角色的导出结果摘要
+    """
+    import bpy
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 发现所有骨架
+    armatures = [obj for obj in bpy.data.objects if obj.type == "ARMATURE"]
+    if not armatures:
+        print("[WARN] 场景中没有 ARMATURE 对象")
+        return []
+
+    results = []
+    print(f"\nBATCH RIGGED EXPORT: {len(armatures)} armature(s) → {output_dir}")
+
+    for arm in armatures:
+        arm_name = arm.name
+
+        # 跳过 Blender 自动生成的重复对象（如 "Name.001"）
+        if "." in arm_name and (name_mesh_map is None or arm_name not in name_mesh_map):
+            if verbose:
+                print(f"    [SKIP] {arm_name}: likely a Blender duplicate (contains '.')")
+            continue
+
+        # 确定 mesh 列表
+        if name_mesh_map and arm_name in name_mesh_map:
+            mesh_names = name_mesh_map[arm_name]
+        else:
+            mesh_names = None  # 自动发现
+
+        out_subdir = os.path.join(output_dir, arm_name)
+        out_path = os.path.join(out_subdir, f"{arm_name}_Low.fbx")
+
+        try:
+            result = export_rigged_model(
+                armature_name=arm_name,
+                output_path=out_path,
+                mesh_names=mesh_names,
+                target=target,
+                move_to_origin=move_to_origin,
+                verbose=verbose,
+            )
+            results.append(result)
+        except Exception as e:
+            print(f"    [ERROR] Export failed for '{arm_name}': {e}")
+            results.append({"armature": arm_name, "error": str(e)})
+
+    # 摘要
+    n_ok = sum(1 for r in results if "error" not in r)
+    print(f"\nBATCH RIGGED EXPORT SUMMARY: {n_ok}/{len(results)} succeeded")
+    for r in results:
+        if "error" in r:
+            print(f"  [ERR] {r['armature']}: {r['error']}")
+        else:
+            print(f"  [OK ] {r['armature']} → {r['path']}")
 
     return results
 
