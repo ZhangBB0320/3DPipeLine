@@ -13,5 +13,12 @@ bake_*.png
 # macOS
 .DS_Store
 
-# CodeBuddy
+# CodeBuddy（项目数据目录，不上传；目录本身保留）
 .codebuddy/
+
+# 生成产物 / 临时文件（V2 管线）
+Output/
+**/.DS_Store
+*.blend1
+*.log
+*.tmp
