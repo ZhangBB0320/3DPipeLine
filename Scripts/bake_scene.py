@@ -31,12 +31,12 @@
 import sys
 import os
 
-# 统一参数（与 bake.py 一致）
-DEFAULT_CAGE = 0.05
+# V2 统一参数（v2_bake.py 会显式传入；这里作为底层默认值保持一致）
+DEFAULT_CAGE = 0.02
 DEFAULT_RES = 4096
 DEFAULT_SAMPLES = 64
 DEFAULT_DEVICE = "GPU"
-DEFAULT_UV_MARGIN = 0.01
+DEFAULT_UV_MARGIN = 0.003
 
 
 # ============================================================
@@ -331,8 +331,8 @@ def bake_scene(
     samples: int = DEFAULT_SAMPLES,
     device: str = DEFAULT_DEVICE,
     uv_margin: float = DEFAULT_UV_MARGIN,
-    skip_uv: bool = False,
-    skip_shrinkwrap: bool = False,
+    skip_uv: bool = True,
+    skip_shrinkwrap: bool = True,
     max_ray_dist: float = 0.0,
 ):
     """

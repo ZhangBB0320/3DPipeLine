@@ -1,181 +1,115 @@
-# 减面质量评估指标体系
+# V2 / V2Lite 低模烘焙质量体系
 
-> 脚本: `Scripts/evaluate_quality.py`
-> 函数: `evaluate_quality(high_obj_name, low_obj_name, ...)`
+> 单入口：`Scripts/v2_pipeline.py`
+> 默认数据目录：`/Users/zbb/Desktop/美术风格确定`，可用 `--root` 覆盖。
+> 产物：`<建筑名><StyleN>LowModel_V2.fbx`（质量主版本）与可选的 `<建筑名><StyleN>LowModel_V2Lite.fbx`（自适应轻量版）。
 
-## 指标总览
+## 1. 代码结构
 
-| 指标组 | 指标 | 理想值 | 权重 | 含义 |
-|--------|------|--------|------|------|
-| **几何保真度** | hausdorff_max | 0 | 25% | 双向 Hausdorff 最大距离（低模与高模最远偏差） |
-| | hausdorff_mean | 0 | 15% | 双向 Hausdorff 平均距离 |
-| | hausdorff_rms | 0 | — | 双向 Hausdorff RMS 距离（参考） |
-| **表面属性** | volume_ratio | 1.0 | 8% | 体积比 Vol(low)/Vol(high) |
-| | area_ratio | ≈0.85 | 7% | 表面积比 Area(low)/Area(high) |
-| | normal_consistency | 1.0 | 10% | 法线一致性（dot product 均值） |
-| **特征保留** | sharp_edge_retention | 1.0 | 12% | 锐边比例保留率 |
-| | boundary_edge_retention | 1.0 | 8% | 边界边比例保留率 |
-| **包裹质量** | coverage_ratio | 1.0 | 10% | 低模对高模的射线覆盖率 |
-| | bbox_max_deviation | 0 | 5% | 包围盒最大偏差 |
-| | **overall_score** | **100** | — | **加权综合评分** |
+| 文件 | 作用 |
+|---|---|
+| `Scripts/v2_pipeline.py` | 宿主批量入口：遍历 zip、解压、调度 Blender、V2 生成、Lite 预算搜索、落盘 |
+| `Scripts/v2_runner.py` | Blender headless 单模型 runner：导入 → V2 减面质量门 → 烘焙 → 导出 FBX |
+| `Scripts/v2_verify.py` | Blender headless 验收：重读高模 OBJ 与导出 FBX，出几何/渲染/光照/UV 报告 |
+| `Scripts/v2_bake.py` | V2 烘焙封装：平直着色、小边距 Smart UV、无 Shrinkwrap、cage 0.02 |
+| `Scripts/bake_scene.py` | Cycles 烘焙底层：材质节点、EMIT Albedo / Normal、贴图隔离 |
+| `Scripts/import_fbx.py` | `safe_import()`：OBJ/FBX 导入与贴图污染隔离 |
+| `Scripts/export_model.py` | `export_model()`：FBX 内嵌纹理 + Unity Y-up |
+| `Scripts/decimation/decimate_adaptive.py` | 固定 V2 体素阶梯 + 预烘焙质量门 |
+| `Scripts/decimation/decimate_strategies.py` | V2 体素重构、QEM COLLAPSE、安全修复 |
+| `Scripts/evaluate_quality.py` | 几何保真度与低模自检 |
+| `Scripts/render_compare.py` | Workbench 贴图/明暗渲染对比 |
+| `Scripts/render_lit.py` | EEVEE 光照对比（含法线贴图与近景机位） |
 
-## 指标详解
+## 2. 固定 V2 配方
 
-### 1. Hausdorff 距离 (几何保真度)
+| 项 | 值 | 原因 |
+|---|---|---|
+| 体素重构 | `voxel_div=700`（退路 500 / 1000 / baseline） | 更细体素保留窗框、栏杆、翅片，几何与贴图误差更低 |
+| 减面容差 | ±3% | 面数贴近预算，不会飘到 3000 面以上太多 |
+| Shrinkwrap | 关闭 | 吸附到噪声高模会让墙面起伏、贴图变差 |
+| cage | 0.02 | 0.01–0.02 为稳定平台区；0.05 会让烘焙射线打到无关表面 |
+| Smart UV 边距 | 0.003 | 小岛很多时，0.01 边距会吃掉大半图集空间 |
+| 着色 | 平直着色 | 与 FBX 导出 `FACE` 法线一致，保证切线空间法线贴图在 Unity 中不偏 |
+| 导出 | FBX 内嵌纹理 + Unity Y-up | 直接交付 Unity |
 
-**核心指标，最直接衡量减面的几何偏差。**
+## 3. 两档产物
 
-- **计算方法**: 在两个模型表面均匀采样 N 个点，用 BVH tree 查询最近点距离
-- **双向计算**: 
-  - High→Low: 从高模采样，查询到低模最近点的距离
-  - Low→High: 从低模采样，查询到高模最近点的距离
-  - 取两个方向的最大值/均值
-- **归一化**: 距离除以高模 BBox 对角线长度，得到百分比
-- **评分阈值**:
-  - max < 2% diag → 90+ 分
-  - max < 5% diag → 75+ 分
-  - max > 20% diag → 0 分
-  - mean < 0.2% diag → 95+ 分
-  - mean > 5% diag → 0 分
+### `_V2`（质量主版本）
 
-### 2. 体积比 (Volume Ratio)
+- 每个有 zip 的模型都会生成。
+- 默认预算 3000 面；若质量门失败，可用 `--max_faces` / `--step` 做升面兜底。
+- 验收报告：`.quality.json`、`.compare.png`、`.lit.png`。
 
-- **计算方法**: bmesh `calc_volume()`，计算封闭网格的体积
-- **理想值**: 1.0（体积完全一致）
-- **典型范围**: 减面后体积通常变化很小（0.98-1.02）
-- **异常**: >1.05 或 <0.95 说明减面导致了显著的膨胀/收缩
+### `_V2Lite`（自适应轻量版）
 
-### 3. 表面积比 (Area Ratio)
+- 不依赖任何旧版文件。先生成/读取 `_V2` 的 `lit` 指标作为基线。
+- 从低到高尝试 `--lite_budgets`（默认 `1000,1500,2000,2500`）。
+- 通过条件：
+  1. 验收判级为 PASS；
+  2. 面数至少比 V2 低 5%；
+  3. 6 项光照指标均不超过 V2 × `--lite_rel`（默认 1.25）+ 微小绝对余量。
+- 第一个达标预算落盘为 `_V2Lite`；没有达标预算则不生成 Lite，也不会留下半成品。
 
-- **计算方法**: 所有面的面积之和
-- **理想值**: ≈0.85（减面后面数减少，但表面积不会等比减少）
-- **典型范围**: 0.8-1.0
-- **异常**: <0.7 说明大量细节几何被删除
+## 4. 验收指标
 
-### 4. 法线一致性 (Normal Consistency)
+`.quality.json` 的 `verify` 字段包含：
 
-- **计算方法**: 在低模表面采样，查询高模最近点的法线，计算 dot product
-- **值域**: [-1, 1]，1 = 完全一致，0 = 正交，-1 = 反转
-- **典型范围**: 0.7-0.95（减面后法线方向基本一致）
-- **评分**: 直接映射到 0-100（0.8 → 80 分）
-- **flipped 比例**: dot < 0 的采样比例，反映反转法线的程度
-- **用途**: 检测减面是否导致面片翻转/法线方向错误
+- `geometry`：Hausdorff 双向采样距离、轮廓一致率、法线翻转率、连通块/边界边/碎片壳等；
+- `render_compare`：Workbench 4 机位贴图与明暗对比；
+- `lit`：EEVEE 4 远景 + 2 近景光照对比，含法线贴图效果，是 V2Lite 判据的数据源；
+- `uv`：UV 越界、重叠、覆盖率、4096 贴图下的纹素密度。
 
-### 5. 锐边保留率 (Sharp Edge Retention)
+EEVEE 首帧渲染前有一次丢弃的预热渲染，用来避免刚导入的 FBX 内嵌贴图尚未上传 GPU 导致的假 FAIL。
 
-- **计算方法**: 
-  - 统计高模中角度 > threshold 的边占比 `high_sharp_ratio`
-  - 统计低模中角度 > threshold 的边占比 `low_sharp_ratio`
-  - 保留率 = `low_sharp_ratio / high_sharp_ratio`，上限 1.0
-- **角度阈值**: 默认 30°，可通过 `sharp_angle` 参数调整
-- **典型范围**: 良好减面 > 0.5；差减面 < 0.2
-- **注意**: 低模面数少，锐边比例可能反而比高模高（这是正常的）
+## 5. 常用命令
 
-### 6. 边界边保留率 (Boundary Edge Retention)
+```bash
+# 桌面目录全量生成 V2 + 合格 Lite，2 个模型并行
+python3 Scripts/v2_pipeline.py --root /Users/zbb/Desktop/美术风格确定 --mode both --jobs 2
 
-- **计算方法**: 类似锐边，但只统计边界边
-- **典型范围**: 1.0（边界边不应丢失）
-- **异常**: <1.0 说明减面导致了开放边界
+# 只生成 V2
+python3 Scripts/v2_pipeline.py --mode v2
 
-### 7. 覆盖率 (Coverage Ratio)
+# 单模型强制重做
+python3 Scripts/v2_pipeline.py --mode both --only 学校大楼/Style1 --force
 
-- **计算方法**: 从高模表面沿法线方向投射射线到低模，统计命中率
-- **射线方向**: 正反两个方向都尝试，一个命中即算
-- **典型范围**: 0.9-1.0（好的低模应覆盖高模 90% 以上表面）
-- **异常**: <0.7 说明低模无法包裹高模，烘焙时会有大量缺失
-
-### 8. BBox 偏差 (BBox Deviation)
-
-- **计算方法**: 比较高低模世界空间 AABB 的最大坐标偏差
-- **典型范围**: <1% 对角线长度
-- **用途**: 快速检测对齐问题
-
-## 综合评分权重
-
-```
-overall = hausdorff_max × 0.25
-        + hausdorff_mean × 0.15
-        + volume × 0.08
-        + area × 0.07
-        + normal × 0.10
-        + sharp_edges × 0.12
-        + boundary × 0.08
-        + coverage × 0.10
-        + bbox × 0.05
+# 只列任务，不跑 Blender
+python3 Scripts/v2_pipeline.py --dry-run
 ```
 
-权重设计逻辑：
-- **Hausdorff (40%)**: 几何偏差是最核心的指标
-- **表面属性 (25%)**: 体积/面积/法线反映减面后的表面质量
-- **特征保留 (20%)**: 锐边和边界保留是建筑模型的关键
-- **包裹质量 (15%)**: 覆盖率和 BBox 影响烘焙质量
+## 6. 已知边界
 
-## 评分等级
+- 玻璃幕墙类模型的自阴影来自高模真实浮雕，法线贴图无法完全复现；V2 相对早期流程的近景提升较小属方法上限。
+- 当前交付只烘焙 Albedo + Normal；玻璃/金属反射需要额外 ORM 或金属-光滑度贴图。
+- `hd_max` 是稀疏离群点指标，不作为 Lite 达标判据；判据使用 p95 与光照渲染指标。
+- 所有旧版、legacy、实验性脚本与过时规范文档均已从代码库移除；不再提供 V1 兼容入口。
 
-| 分数 | 等级 | 含义 |
-|------|------|------|
-| 90-100 | A (优秀) | 减面质量极高，几乎无损失 |
-| 80-89 | B (良好) | 减面质量好，可接受 |
-| 70-79 | C (一般) | 减面质量一般，某些指标需优化 |
-| 60-69 | D (较差) | 减面质量差，需要调参 |
-| <60 | F (不合格) | 减面质量不可接受 |
+## 7. 三轮 Debug 验证（`/Users/zbb/Desktop/美术风格确定`）
 
-## 用法示例
+### 第 1 轮：静态与目录验证
+- 全量 `py_compile` 通过；`v2_pipeline.py --dry-run` 识别 10 个 Style 任务，其中 7 个有 zip、3 个无 zip。
+- 旧引用扫描最初发现 4 处与已删旧文件同名的函数命名残留，已统一重命名为 `bake_v2`；复扫 `NO_STALE_REFS`。
+- 确认 `render_lit.py` 的 EEVEE 预热渲染仍在，避免首帧贴图未上传 GPU 的假 FAIL。
 
-```python
-# 标准流水线中调用
-from blender_connect import ensure_blender, send_python
-send_python('''
-import sys
-sys.path.insert(0, "/Users/zbb/3DPipeLine/Scripts")
-from evaluate_quality import evaluate_quality
+### 第 2 轮：单模型端到端
+- `学校大楼/Style1`：`_V2` 3023 面 PASS；`_V2Lite` 2489 面 PASS。
+- 两份 `.compare.png` / `.lit.png` 哈希不同，确认不是重复联系表。
+- 复核脚本最初未清空 `bpy.data.images`，导致第二个 FBX 的贴图数被累计；已修正复核方式。修正后两份 FBX 均为 1 mesh / 1 material / 2 张内嵌贴图。
 
-# 评估当前场景中的高低模
-result = evaluate_quality("node_0", "Building_Low", name="Building")
-print(result["overall_score"])
-print(result["summary"])
-''', recv_timeout=300)
+### 第 3 轮：桌面目录全量重跑
 
-# 关键指标快速读取
-# result["hausdorff_max_pct_diag"]  — Hausdorff 最大偏差（% 对角线）
-# result["volume_ratio"]            — 体积比
-# result["normal_consistency"]      — 法线一致性
-# result["coverage_ratio"]          — 覆盖率
-# result["overall_score"]           — 综合评分
-```
+| 结果 | 数量 |
+|---|---:|
+| 有 zip 的模型 | 7 |
+| 无 zip 跳过 | 3 |
+| `_V2` 生成且 PASS | 7 |
+| `_V2Lite` 生成且 PASS | 6 |
+| 不合格而不生成 Lite | 1（学校 Style2） |
+| 失败 | 0 |
 
-## 当前模型评估结果 (Building, 1.48M → 3K)
-
-```
-  [几何保真度]
-    Hausdorff max:  0.029 (2.29% diag)     ← 良好
-    Hausdorff mean: 0.002 (0.15% diag)     ← 优秀
-    Hausdorff RMS:  0.003 (0.21% diag)     ← 优秀
-
-  [表面属性]
-    Volume ratio:   1.0038                 ← 几乎完美
-    Area ratio:     0.9226                 ← 正常
-    Normal consist: 0.8008                 ← 良好
-
-  [特征保留]
-    Sharp edges:    100.0% retained        ← 优秀
-    Boundary:       100.0% retained        ← 优秀
-
-  [包裹质量]
-    Coverage:       95.9%                  ← 优秀
-    BBox deviation: 0.0074                 ← 优秀
-
-  ═══════════════════════════════════
-  OVERALL SCORE: 91.2 / 100 (A)
-  ═══════════════════════════════════
-```
-
-## 参数优化方向
-
-| 评分低 | 优化方向 |
-|--------|----------|
-| Hausdorff 差 | 降低 step_ratio（更小步长）、增大 crease_angle |
-| Volume 差 | 检查是否有封闭性破坏、调整 decimate 算法 |
-| Normal 差 | 增加法线保护、使用渐进减面替代一步减面 |
-| Sharp edges 差 | 增大 crease_angle、减小 step_ratio |
-| Coverage 差 | 检查低模是否包裹高模、增大 cage 距离 |
+- `_V2` 平均 2988 面，平均 `lit_tex_err=0.0107`、近景贴图 p95 `0.0560`。
+- `_V2Lite` 平均 2323 面，平均 `lit_tex_err=0.0124`、近景贴图 p95 `0.0651`。
+- 13 个最终 FBX 全部用 Blender 重导入通过：每个都是 1 mesh / 1 material / 2 张 packed 贴图。
+- 全部日志扫描无真实错误（仅 Rokoko addon 的无害 LZ4 警告）。
+- V2Lite 现在以 V2 为基线，不再依赖任何旧版 `_New` / V1 产物；因此预算相对上一轮实验略有变化，这是去旧化后的正常结果。
